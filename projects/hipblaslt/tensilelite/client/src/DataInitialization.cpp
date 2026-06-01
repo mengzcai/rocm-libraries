@@ -2854,14 +2854,28 @@ namespace TensileLite
 
             inputs->ws = ws;
 
+            // Per-tensor offset advance helper: read offsets[T][idx] safely. When a tensor's
+            // dataType varies across sub-gemms (e.g. BIAS with multiple BiasTypeArgs), the init
+            // code in initializeCPUInputs stores offsets in pristine[T][dataType], so the per-
+            // tensor offsets vector only has entries for sub-gemms with the *matching* dataType
+            // and is shorter than the total sub-gemm count. Without this check, reading
+            // offsets[T][idx] for sub-gemms beyond that count is std::vector OOB which returns
+            // garbage; that garbage byte-count then advances u8Ptr[T] into unmapped memory, and
+            // later subsetContractionInputs() stores a wild pointer into unit.{T} — causing SEGV
+            // in solveCPUFastInF32's GetValue<...>(typedPtr[pos]) deep inside OMP workers.
+            auto advanceCount = [&offsets](int tensorIdx, int idx) -> size_t {
+                return (idx < (int)offsets[tensorIdx].size()) ? offsets[tensorIdx][idx] : 0;
+            };
+
             for(int idx = 0; idx < offsets[0].size(); idx++)
             {
                 ContractionInputs   unit;
                 std::vector<size_t> maxElements;
                 for(size_t j = 0; j < offsets.size(); j++)
                 {
-
-                    if(offsets[j].size() != 0)
+                    // Same OOB hazard as the advances below — bound-check idx against this
+                    // tensor's per-dataType offsets length.
+                    if(idx < (int)offsets[j].size())
                     {
                         maxElements.push_back(offsets[j][idx]);
                     }
@@ -2874,60 +2888,64 @@ namespace TensileLite
                 inputs->grouped.push_back(unit);
 
                 u8Ptr[ContractionProblemGemm::TENSOR::A] += multiplyElementSize(
-                    offsets[ContractionProblemGemm::TENSOR::A][idx], problem.a().elementBytes());
+                    advanceCount(ContractionProblemGemm::TENSOR::A, idx),
+                    problem.a().elementBytes());
                 u8Ptr[ContractionProblemGemm::TENSOR::B] += multiplyElementSize(
-                    offsets[ContractionProblemGemm::TENSOR::B][idx], problem.b().elementBytes());
+                    advanceCount(ContractionProblemGemm::TENSOR::B, idx),
+                    problem.b().elementBytes());
                 u8Ptr[ContractionProblemGemm::TENSOR::C] += multiplyElementSize(
-                    offsets[ContractionProblemGemm::TENSOR::C][idx], problem.c().elementBytes());
+                    advanceCount(ContractionProblemGemm::TENSOR::C, idx),
+                    problem.c().elementBytes());
                 u8Ptr[ContractionProblemGemm::TENSOR::D] += multiplyElementSize(
-                    offsets[ContractionProblemGemm::TENSOR::D][idx], problem.d().elementBytes());
+                    advanceCount(ContractionProblemGemm::TENSOR::D, idx),
+                    problem.d().elementBytes());
                 if(u8Ptr[ContractionProblemGemm::TENSOR::E] != nullptr)
                 {
                     u8Ptr[ContractionProblemGemm::TENSOR::E] += multiplyElementSize(
-                        offsets[ContractionProblemGemm::TENSOR::E][idx],
+                        advanceCount(ContractionProblemGemm::TENSOR::E, idx),
                         problem.tensors()[ContractionProblemGemm::TENSOR::E].elementBytes());
                 }
                 if(u8Ptr[ContractionProblemGemm::TENSOR::BIAS] != nullptr)
                 {
                     u8Ptr[ContractionProblemGemm::TENSOR::BIAS] += multiplyElementSize(
-                        offsets[ContractionProblemGemm::TENSOR::BIAS][idx],
+                        advanceCount(ContractionProblemGemm::TENSOR::BIAS, idx),
                         problem.tensors()[ContractionProblemGemm::TENSOR::BIAS].elementBytes());
                 }
                 if(u8Ptr[ContractionProblemGemm::TENSOR::SCALEA] != nullptr)
                 {
                     u8Ptr[ContractionProblemGemm::TENSOR::SCALEA] += multiplyElementSize(
-                        offsets[ContractionProblemGemm::TENSOR::SCALEA][idx],
+                        advanceCount(ContractionProblemGemm::TENSOR::SCALEA, idx),
                         problem.tensors()[ContractionProblemGemm::TENSOR::SCALEA].elementBytes());
                 }
                 if(u8Ptr[ContractionProblemGemm::TENSOR::SCALEB] != nullptr)
                 {
                     u8Ptr[ContractionProblemGemm::TENSOR::SCALEB] += multiplyElementSize(
-                        offsets[ContractionProblemGemm::TENSOR::SCALEB][idx],
+                        advanceCount(ContractionProblemGemm::TENSOR::SCALEB, idx),
                         problem.tensors()[ContractionProblemGemm::TENSOR::SCALEB].elementBytes());
                 }
                 if(u8Ptr[ContractionProblemGemm::TENSOR::SCALEC] != nullptr)
                 {
                     u8Ptr[ContractionProblemGemm::TENSOR::SCALEC] += multiplyElementSize(
-                        offsets[ContractionProblemGemm::TENSOR::SCALEC][idx],
+                        advanceCount(ContractionProblemGemm::TENSOR::SCALEC, idx),
                         problem.tensors()[ContractionProblemGemm::TENSOR::SCALEC].elementBytes());
                 }
                 if(u8Ptr[ContractionProblemGemm::TENSOR::SCALED] != nullptr)
                 {
                     u8Ptr[ContractionProblemGemm::TENSOR::SCALED] += multiplyElementSize(
-                        offsets[ContractionProblemGemm::TENSOR::SCALED][idx],
+                        advanceCount(ContractionProblemGemm::TENSOR::SCALED, idx),
                         problem.tensors()[ContractionProblemGemm::TENSOR::SCALED].elementBytes());
                 }
                 if(u8Ptr[ContractionProblemGemm::TENSOR::SCALEALPHAVEC] != nullptr)
                 {
                     u8Ptr[ContractionProblemGemm::TENSOR::SCALEALPHAVEC] += multiplyElementSize(
-                        offsets[ContractionProblemGemm::TENSOR::SCALEALPHAVEC][idx],
+                        advanceCount(ContractionProblemGemm::TENSOR::SCALEALPHAVEC, idx),
                         problem.tensors()[ContractionProblemGemm::TENSOR::SCALEALPHAVEC]
                             .elementBytes());
                 }
                 if(u8Ptr[ContractionProblemGemm::TENSOR::Synchronizer] != nullptr)
                 {
                     u8Ptr[ContractionProblemGemm::TENSOR::Synchronizer] += multiplyElementSize(
-                        offsets[ContractionProblemGemm::TENSOR::Synchronizer][idx],
+                        advanceCount(ContractionProblemGemm::TENSOR::Synchronizer, idx),
                         problem.tensors()[ContractionProblemGemm::TENSOR::Synchronizer]
                             .elementBytes());
                 }
