@@ -1,0 +1,125 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+#
+# GEMM-level repro for the suspected gfx1250 ds_load_tr4 hardware transient.
+# Runs FP4 MT256x256x256 DU256 in three layouts:
+#   NN (Ailk_Bljk): A=ds_load_tr4, B=ds_load_b128  -> fragile (uses tr4)
+#   TN (Alik_Bljk): A=ds_load_b128, B=ds_load_b128 -> robust  (no tr4)
+#   TT (Alik_Bjlk): A=ds_load_b128, B=ds_load_tr4  -> fragile (uses tr4)
+# On a machine in the bad state, NN and TT intermittently FAIL validation while
+# TN always passes. Unlike tr4_stress.hip, this uses fully valid TensileLite
+# codegen, so it will NOT hang the GPU. Run repeatedly (env HSA_ENABLE_SDMA=0):
+#   Tensile fp4_tr4_layouts.yaml /tmp/out
+# The fragility reproduces on both TDM and BufferLoad; set TDMInst: [0, 3] to
+# cover both load paths.
+TestParameters:
+  marks: [skip-gfx900, skip-gfx906, skip-gfx908, skip-gfx90a, skip-gfx940, skip-gfx941, skip-gfx942, skip-gfx950, skip-gfx1010, skip-gfx1011, skip-gfx1012, skip-gfx1030, skip-gfx1100, skip-gfx1101, skip-gfx1102, skip-gfx1200, skip-gfx1201]
+
+GlobalParameters:
+  SyncsPerBenchmark: 0
+  NumElementsToValidate: -1
+  KernelTime: False
+  BoundsCheck: 0
+  PrintSolutionRejectionReason: True
+  ValidationMaxToPrint: 4
+  ValidationPrintValids: False
+  PruneSparseMode: 0
+  DataInitTypeA: 3
+  DataInitTypeB: 3
+  DataInitTypeC: 0
+  DataInitTypeD: 3
+  DataInitTypeAlpha: 1
+  DataInitTypeBeta: 0
+  NumWarmups: 0
+  EnqueuesPerSync: 1
+  PrintWinnersOnly: False
+  Architecture: gfx1250
+  KeepBuildTmp: True
+  PrintLevel: 2
+
+BenchmarkProblems:
+  -
+    - # ProblemType NN  (TransposeA=False, TransposeB=False)
+      OperationType: GEMM
+      DataType: F4
+      DestDataType: s
+      ComputeDataType: s
+      HighPrecisionAccumulate:  True
+      TransposeA: False
+      TransposeB: False
+      UseBeta: True
+      Batched: True
+      Activation: False
+      SupportUserArgs: True
+      UseBias: 0
+    - &grp
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 128, 1,  1,  8, 8,  2, 2]
+        - DepthU: [256]
+        - InitCIterWmma: [0]
+        - LDSTrInst: [True]
+        - LocalReadVectorWidth: [32]
+        - ScheduleIterAlg: [0]
+        - PrefetchGlobalRead: [0]
+        - PrefetchLocalRead: [0]
+        - VectorWidthA: [1]
+        - VectorWidthB: [1]
+        - GlobalReadVectorWidthA: [32]
+        - GlobalReadVectorWidthB: [32]
+        - InnerUnroll: [1]
+        - LdsBlockSizePerPadA: [-1]
+        - LdsBlockSizePerPadB: [-1]
+        - TransposeLDS: [-1]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - WaveSeparateGlobalReadA: [0]
+        - WaveSeparateGlobalReadB: [0]
+        - 1LDSBuffer: [0]
+        - GlobalReadPerMfma: [1.0]
+        - LocalWritePerMfma: [-1]
+        - StoreVectorWidth: [-1]
+        - SourceSwap: [true]
+        - WavefrontSize: [32]
+        - TDMInst: [3]
+        - StaggerU: [0]
+        - StaggerUMapping: [0]
+      BenchmarkForkParameters:
+      JoinParameters:
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [256, 256, 1, 256]
+  -
+    - # ProblemType TN  (TransposeA=True, TransposeB=False)
+      OperationType: GEMM
+      DataType: F4
+      DestDataType: s
+      ComputeDataType: s
+      HighPrecisionAccumulate:  True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: True
+      Batched: True
+      Activation: False
+      SupportUserArgs: True
+      UseBias: 0
+    - *grp
+  -
+    - # ProblemType TT  (TransposeA=True, TransposeB=True)
+      OperationType: GEMM
+      DataType: F4
+      DestDataType: s
+      ComputeDataType: s
+      HighPrecisionAccumulate:  True
+      TransposeA: True
+      TransposeB: True
+      UseBeta: True
+      Batched: True
+      Activation: False
+      SupportUserArgs: True
+      UseBias: 0
+    - *grp
