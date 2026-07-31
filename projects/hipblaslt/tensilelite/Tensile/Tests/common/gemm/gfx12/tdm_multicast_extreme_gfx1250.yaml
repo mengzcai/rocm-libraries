@@ -1,0 +1,210 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+#
+# EXTREME padded-ratio probe for ClusterMaskReduce (RED vs NORED).
+# Goal: make the padded-WG fraction as high as possible so that IF mask reduction
+# is actually effective, RED must beat NORED by a large, unambiguous dur margin;
+# if RED still ties NORED here, that is strong evidence the reduction is a no-op.
+#
+# Why single-cluster: padding only rounds the OUTER grid edge up to ClusterDim, so
+# interior clusters are always full. The only way to get a mostly-padded cluster is
+# a grid that IS a single boundary cluster. CD[4,4] => 16 WG/cluster; a 1x1 real
+# tile grid => 1 real + 15 padded (15/16 padded).
+#
+# Why huge K: the multicast timeout is paid PER unroll iteration. K/DepthU = #iters.
+# K=8192, DepthU=256 => 32 iters, so any per-iter timeout stall is amplified 64x
+# and should dominate the (tiny, 1-WG) compute, making a real RED speedup obvious.
+TestParameters:
+  marks: [skip-gfx900, skip-gfx906, skip-gfx908, skip-gfx90a, skip-gfx940, skip-gfx941, skip-gfx942, skip-gfx950, skip-gfx1010, skip-gfx1011, skip-gfx1012, skip-gfx1030, skip-gfx1100, skip-gfx1101, skip-gfx1102, skip-gfx1200, skip-gfx1201] # not supported by arch
+GlobalParameters:
+  SyncsPerBenchmark: 0
+  NumElementsToValidate: 1 #至少要1才會跑perf counter
+  KernelTime: True
+  BoundsCheck: 0
+  PrintSolutionRejectionReason: True
+  ValidationMaxToPrint: 4
+  ValidationPrintValids: False
+  PruneSparseMode: 0
+  DataInitTypeA: 3
+  DataInitTypeB: 3
+  DataInitTypeD: 0
+  DataInitTypeMXSA: 3
+  DataInitTypeMXSB: 3
+  DataInitTypeAlpha: 1
+  DataInitTypeBeta: 0
+  NumWarmups: 10
+  EnqueuesPerSync: 3
+  RotatingBufferSize: 2048   # bumped for K=8192 grows per-matrix footprint
+  IcacheRotateCopies: -1
+  PrintWinnersOnly: False
+  Architecture: gfx1250
+  CpuThreads: 1
+  KeepBuildTmp: True
+  PrintLevel: 2
+  ForceGenerateKernel: [True]
+
+BenchmarkProblems:
+  -
+    - # ProblemType, TN
+      OperationType: GEMM
+      DataType: F8
+      MacDataTypeA: F8
+      MacDataTypeB: F4
+      DestDataType: s
+      ComputeDataType: s
+      HighPrecisionAccumulate:  True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: True
+      Batched: True
+      SupportUserArgs: True
+
+    - # BenchmarkProblemSizeGroup - Standard
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - UseSgprForGRO: [0]
+        - ForceDisableShadowInit: [true]
+        - MatrixInstruction:
+          - [16, 16, 128, 1,  1,   1, 1,  2,2 ]  # 32x32
+          - [16, 16, 128, 1,  1,   2, 2,  2,2 ]  # 64x64
+          - [16, 16, 128, 1,  1,   4, 4,  2,2 ]  # 128x128
+          - [16, 16, 128, 1,  1,   8, 8,  2,2 ]  # 256x256
+        - DepthU: [128,256]
+        - ClusterLocalRead: [0]
+        - TransposeLDS: [-1]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - LdsPadMXSA: [0]
+        - LdsPadMXSB: [0]
+        - LdsBlockSizePerPadA: [-1]
+        - LdsBlockSizePerPadB: [-1]
+        - LdsBlockSizePerPadMXSA: [0]
+        - LdsBlockSizePerPadMXSB: [0]
+        - LdsPadMetadata: [0]
+        - LDSTrInst: [False]
+        - TDMInst: [3]
+        - StaggerU: [0]
+        - ScheduleIterAlg: [0]
+        - PrefetchLocalRead: [1]
+        - PrefetchGlobalRead: [1]
+        - StoreRemapVectorWidth: [0]
+        - GlobalSplitU: [1]
+        - GlobalSplitUAlgorithm: [MultipleBuffer]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - VectorWidthA: [1]
+        - VectorWidthB: [1]
+        - LocalReadVectorWidth: [-1]
+        - 1LDSBuffer: [0]
+        - SourceSwap: [false]
+        - DirectToVgprSparseMetadata: [false]
+        - WorkGroupMapping: [1]
+        - StoreVectorWidth: [-1]
+        - DirectToVgprA: [False]
+        - DirectToVgprB: [False]
+        - WavefrontSize: [32]
+        - ClusterDim: [[4, 4]]
+        - ClusterMaskReduce: [False, True]
+        - MulticastEarlyTimeout: [False, True]
+      BenchmarkForkParameters:
+      JoinParameters:
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          # ---- EXTREME: 1 real WG in a 4x4 cluster (15/16 padded), both waves reduced ----
+          - Exact: [256, 256, 1, 8192]  # 1x1 real -> 4x4 padded, #pad=15, 32 iters  <-- key probe (4-wave WG)
+          - Exact: [256, 256, 1,  4096]  # 1x1 real -> 4x4 padded, #pad=15, 16 iters  (K-scaling check)
+
+          # ---- Baselines: full 4x4 cluster, NO padding (RED must == NORED here) ----
+          - Exact: [1024, 1024, 1, 8192] # 4x4=16 real, #pad=0, 32 iters (reference: mask identical RED/NORED)
+          - Exact: [1024, 1024, 1,  4096] # 4x4=16 real, #pad=0, 16 iters
+
+          # ---- Directional: reduce ONLY one wave, isolate even(col) vs odd(row) mask ----
+          #- Exact: [256, 1024, 1, 8192] # 1x4 real -> 4x4 padded, #pad=12 (full row present; column mask reduced)
+          #- Exact: [1024, 256, 1, 8192] # 4x1 real -> 4x4 padded, #pad=12 (full col present; row mask reduced)
+
+          - Exact: [320, 320, 1, 8192]  # 1x1 real -> 4x4 padded, #pad=15, 32 iters  <-- key probe (4-wave WG)
+          - Exact: [320, 320, 1,  4096]  # 1x1 real -> 4x4 padded, #pad=15, 16 iters  (K-scaling check)
+
+          - Exact: [704, 704, 1, 8192]  # 1x1 real -> 4x4 padded, #pad=15, 32 iters  <-- key probe (4-wave WG)
+          - Exact: [704, 704, 1,  4096]  # 1x1 real -> 4x4 padded, #pad=15, 16 iters  (K-scaling check)
+
+          - Exact: [1280, 1280, 1, 8192] # 4x4=16 real, #pad=0, 32 iters (reference: mask identical RED/NORED)
+          - Exact: [1280, 1280, 1,  4096] # 4x4=16 real, #pad=0, 16 iters
+
+          - Exact: [2560, 2560, 1,  4096] # 4x4=16 real, #pad=0, 16 iters
+
+    # ==================================================================================
+    # SINGLE-WAVE probe (WaveGroup=[1,1] => 1 wave/WG). Isolates Q3: "can the 4 waves
+    # WITHIN one WG cause timeout even for a self-only cluster?". The 4-wave group above
+    # emits even/odd-parity masks (each wave issues its own ld_bcst; waves can wait on
+    # each other). Here each WG is a single wave, taking the NumWaves==1 else-branch
+    # (MulticastMaskA/B, no parity split). If single-wave self-only timeout == 0 but the
+    # 4-wave self-only timeout != 0, timeout is an intra-WG inter-wave effect, NOT a mask bug.
+    - # BenchmarkProblemSizeGroup - single-wave
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - UseSgprForGRO: [0]
+        - ForceDisableShadowInit: [true]
+        - MatrixInstruction:
+          - [16, 16, 128, 1,  1,   1, 1,  1,1 ]  # MT16,   1 wave/WG
+          - [16, 16, 128, 1,  1,   2, 2,  1,1 ]  # MT32,   1 wave/WG
+          - [16, 16, 128, 1,  1,   4, 4,  1,1 ]  # MT64,   1 wave/WG
+          - [16, 16, 128, 1,  1,   8, 8,  1,1 ]  # MT128x128, 1 wave/WG
+        - DepthU: [128,256]
+        - ClusterLocalRead: [0]
+        - TransposeLDS: [-1]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - LdsPadMXSA: [0]
+        - LdsPadMXSB: [0]
+        - LdsBlockSizePerPadA: [-1]
+        - LdsBlockSizePerPadB: [-1]
+        - LdsBlockSizePerPadMXSA: [0]
+        - LdsBlockSizePerPadMXSB: [0]
+        - LdsPadMetadata: [0]
+        - LDSTrInst: [False]
+        - TDMInst: [3]
+        - StaggerU: [0]
+        - ScheduleIterAlg: [0]
+        - PrefetchLocalRead: [1]
+        - PrefetchGlobalRead: [1]
+        - StoreRemapVectorWidth: [0]
+        - GlobalSplitU: [1]
+        - GlobalSplitUAlgorithm: [MultipleBuffer]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - VectorWidthA: [1]
+        - VectorWidthB: [1]
+        - LocalReadVectorWidth: [-1]
+        - 1LDSBuffer: [0]
+        - SourceSwap: [false]
+        - DirectToVgprSparseMetadata: [false]
+        - WorkGroupMapping: [1]
+        - StoreVectorWidth: [-1]
+        - DirectToVgprA: [False]
+        - DirectToVgprB: [False]
+        - WavefrontSize: [32]
+        - ClusterDim: [[4, 4]]
+        - ClusterMaskReduce: [False, True]
+        - MulticastEarlyTimeout: [False, True]
+      BenchmarkForkParameters:
+      JoinParameters:
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          # MT64x64: 1x1 real -> 4x4 padded (#pad=15) single-wave, extreme + K scaling
+          - Exact: [64, 64, 1, 8192]    # 1x1 real, #pad=15, 32 iters, 1 wave/WG  <-- Q3 probe
+          - Exact: [256, 256, 1, 8192]  # 4x4=16 real, #pad=0, single-wave baseline (RED==NORED)
+          # MT128x128: 1x1 real -> 4x4 padded single-wave
+          - Exact: [128, 128, 1, 8192]  # 1x1 real, #pad=15, 32 iters, 1 wave/WG
+          - Exact: [512, 512, 1, 8192]  # 4x4=16 real, #pad=0, single-wave baseline
+
+          - Exact: [160, 320, 1, 4096]  # 1x1 real -> 4x4 padded, #pad=15, 32 iters  <-- key probe (4-wave WG)
+          - Exact: [320, 320, 1, 4096]  # 1x1 real -> 4x4 padded, #pad=15, 16 iters  (K-scaling check)
+          - Exact: [640, 640, 1, 4096]  # 1x1 real -> 4x4 padded, #pad=15, 32 iters  <-- key probe (4-wave WG)
+          - Exact: [1280, 1280, 1, 4096]  # 1x1 real -> 4x4 padded, #pad=15, 16 iters  (K-scaling check)

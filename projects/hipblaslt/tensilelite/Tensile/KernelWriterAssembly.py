@@ -2751,7 +2751,13 @@ class KernelWriterAssembly(KernelWriter):
               # Reduce the broadcast mask to the WGs actually present in a padded
               # boundary cluster. Writes maskColSgpr/maskRowSgpr and returns True; for
               # Stream-K or non-cluster it returns False and we fall back to the full mask.
-              reduced = self.computeMulticastMaskReduction(kernel, moduleRegInit, sgprWgX, sgprWgY, maskColSgpr, maskRowSgpr)
+              # ClusterMaskReduce=False keeps padding + early-exit but emits the FULL
+              # multicast mask (no reduction), so a boundary cluster waits on the ld_bcst
+              # timeout for padded WGs; used to measure how much the reduction helps.
+              if kernel.get("ClusterMaskReduce", True):
+                reduced = self.computeMulticastMaskReduction(kernel, moduleRegInit, sgprWgX, sgprWgY, maskColSgpr, maskRowSgpr)
+              else:
+                reduced = False
               if not reduced:
                 maskColSgpr = None
                 maskRowSgpr = None
@@ -19172,6 +19178,8 @@ class KernelWriterAssembly(KernelWriter):
     mod.add(comp.setGlobalAddr(descSgprName(0), f"Address{tc}"))
     if kernel["Multicast"] and enableCluster:
       mod.add(comp.setMulticastMask(descSgprName(1), maskSgprName(tc), self))
+      if kernel.get("MulticastEarlyTimeout", False):
+        mod.add(comp.setEarlyTimeout(descSgprName(1), self))
 
     with self.allocTmpSgpr(2, tag="initTDMDescriptor_tmpSgprRes") as tmpSgprRes:
       waveOffsetSgprIdx: int = tmpSgprRes.idx
@@ -19330,6 +19338,8 @@ class KernelWriterAssembly(KernelWriter):
     mod.add(comp.setGlobalAddr(descSgprName(0), f"Address{tc}"))
     if kernel["Multicast"] and enableCluster:
       mod.add(comp.setMulticastMask(descSgprName(1), maskSgprName(tc), self))
+      if kernel.get("MulticastEarlyTimeout", False):
+        mod.add(comp.setEarlyTimeout(descSgprName(1), self))
 
     with self.allocTmpSgpr(2, tag="initTDMDescriptorWaveSeparatedImpl_tmpSgprRes") as tmpSgprRes:
       waveOffsetSgprIdx: int = tmpSgprRes.idx

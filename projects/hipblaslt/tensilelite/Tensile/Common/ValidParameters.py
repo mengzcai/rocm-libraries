@@ -1126,6 +1126,12 @@ validParameters = { # we need to make sure this matches develop
     # Cluster dimension. Clusters have up to 16 work-groups in a cluster, but each work-group in a
     # cluster runs on a separate WGP.
     "ClusterDim": validClusterDimensions,
+    # Reduce the TDM-multicast mask to the WGs actually present in a boundary cluster
+    # (True) vs emit the full mask (False). Only affects Multicast kernels.
+    "ClusterMaskReduce": [False, True],
+    # Set descriptor Group1 bit 21 (early_timeout) on TDM-multicast loads (True) vs standard
+    # timeout (False). Only affects Multicast kernels.
+    "MulticastEarlyTimeout": [False, True],
     # Enable PLR 0.5 to save vgprs
     # 0: Disabled
     # 1: Use PLR 0.5 for A

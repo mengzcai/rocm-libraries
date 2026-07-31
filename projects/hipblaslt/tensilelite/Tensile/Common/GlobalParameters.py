@@ -616,6 +616,16 @@ defaultBenchmarkCommonParameters = [
     # [1, 1] disables clustering. Non-[1, 1] enables Multicast so workgroups within
     # a cluster can share data loaded via TDM-multicast, reducing redundant global reads.
     {"ClusterDim": [[1, 1]]},
+    # ClusterMaskReduce — for boundary clusters (grid padded up to ClusterDim), reduce the
+    # TDM-multicast mask to the work-groups actually present so surviving WGs do not wait on
+    # the ld_bcst timeout for padded WGs that early-exit. True (default) = reduced mask;
+    # False = full mask (only meaningful with Multicast; useful for A/B timeout comparison).
+    {"ClusterMaskReduce": [True]},
+    # MulticastEarlyTimeout — set descriptor Group1 bit 21 (early_timeout / M0[16]) so GL1
+    # returns broadcast data as soon as the cache supplies it to whichever waves have
+    # requested, instead of waiting the standard ld_bcst timer. False (default) = standard
+    # timeout. Experimental: probes whether early-timeout affects dur / timeout counts.
+    {"MulticastEarlyTimeout": [False]},
     {"HalfPLR": [0]},
     {"TDMIterateMode": [0]}
 ]

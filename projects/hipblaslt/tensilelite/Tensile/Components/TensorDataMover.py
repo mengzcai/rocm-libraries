@@ -513,6 +513,14 @@ class TensorDataMoverLoad(TensorDataMover):
         mod.add(SOrB32(sgpr(f"{group1}"), sgpr(f"{group1}"), sgpr(f"{mask}")))
         return mod
 
+    def setEarlyTimeout(self, group1: int | str, writer: "KernelWriterAssembly") -> Module:
+        # Descriptor Group1 bit 21 = early_timeout (spec: M0[16]). GL1 returns broadcast
+        # data as soon as the cache supplies it to whichever waves have requested, instead
+        # of waiting the standard ld_bcst timer.
+        mod = Module()
+        mod.add(SOrB32(sgpr(f"{group1}"), sgpr(f"{group1}"), hex(0x200000), "set early_timeout (D# Group1 bit 21)"))
+        return mod
+
     def setIterationIncrements(self, group2: int | str, ldsInc: int, sgprGlobalInc: int | str) -> Module:
         mod = Module()
         mod.add(SMovB32(sgpr(f"{group2}+1"), hex(ldsInc), f"set lds increment to {ldsInc}"))
