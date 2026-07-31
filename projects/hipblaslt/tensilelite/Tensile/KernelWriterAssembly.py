@@ -2330,6 +2330,60 @@ class KernelWriterAssembly(KernelWriter):
     module.add(SCmpGeU32(src0=sgpr("WorkGroup0"), src1=sgpr("NumWorkGroups0"),
                          comment="padded if WorkGroup0 >= tilesM"))
     module.add(SCBranchSCC1(labelName=padExitLabel.getLabelName()))
+    cy = kernel["ClusterDim"][1]
+    # With a Y-extent cluster + GSU-outer packing (GSUWGMRR), the host pads each
+    # GSU block's N-tile count up to cy (raw_y = gsu_idx*paddedTilesN + N_tile),
+    # so a padded WG is one whose in-block index N_tile = WorkGroup1 % paddedTilesN
+    # is >= tilesN. Otherwise (GSU-inner packing) the padded WGs sit at the tail,
+    # WorkGroup1 >= tilesN*GSU. GSUWGMRR is chosen at runtime (0x4000 bit of GSU),
+    # so branch on it here to match graWorkGroup's decode. This runs before decode,
+    # so WorkGroup1 still holds the raw grid-y index; do not clobber it.
+    blockAware = clusterEnabled(kernel["ClusterDim"]) and cy > 1 and kernel["StreamK"] == 0
+    if blockAware and kernel["GlobalSplitU"] != 0:
+      wgmrrExitLabel = Label(self.labels.getNameInc("ClusterPad_GSUWGMRR"), "")
+      wgmrrEndLabel  = Label(self.labels.getNameInc("ClusterPad_GSUWGMRR_End"), "")
+      # t0=paddedTilesN, t0+1=in-block N_tile (remainder). ceilScratch is a separate
+      # even-aligned pair because scalarStaticCeilDivide's non-power-of-2 path (cy=3,5,..)
+      # emits s_lshl_b64/s_lshr_b64, which the assembler requires to be even-aligned.
+      tmpVgpr = self.vgprPool.checkOut(2, tag="clusterPad_tmpVgpr")
+      tmpVgprRes = ContinuousRegister(idx=tmpVgpr, size=2)
+      with self.allocTmpSgpr(2, tag="clusterPad_tmpSgpr") as padTmp, \
+           self.allocTmpSgpr(2, alignment=2, tag="clusterPad_ceilScratch") as ceilScratch:
+        t0 = padTmp.idx
+        module.add(SAndB32(dst=sgpr(t0), src0=sgpr("GSU"), src1=hex(0x4000),
+                           comment="SCC = (GSUWGMRR == 1) ?"))
+        module.add(SCBranchSCC1(labelName=wgmrrExitLabel.getLabelName(),
+                                comment="branch if GSUWGMRR == 1"))
+        # GSU-inner (RR=0): padded if WorkGroup1 >= tilesN*GSU
+        module.add(SAndB32(dst=sgpr(t0), src0=sgpr("GSU"),
+                           src1=self.gsuMaskHex(kernel), comment="Restore GSU"))
+        module.add(SMulI32(dst=sgpr(t0), src0=sgpr("NumWorkGroups1"),
+                           src1=sgpr(t0), comment="tilesN * GSU"))
+        module.add(SCmpGeU32(src0=sgpr("WorkGroup1"), src1=sgpr(t0),
+                             comment="padded if WorkGroup1 >= tilesN*GSU"))
+        module.add(SCBranchSCC1(labelName=padExitLabel.getLabelName()))
+        module.add(SBranch(labelName=wgmrrEndLabel.getLabelName()))
+        # GSU-outer (RR=1): paddedTilesN = RoundUp(tilesN, cy);
+        #                   padded if (WorkGroup1 % paddedTilesN) >= tilesN
+        module.add(wgmrrExitLabel)
+        module.add(scalarStaticCeilDivide(qReg=sgpr(t0), dReg=sgpr("NumWorkGroups1"),
+                                          divisor=cy,
+                                          tmpSgprRes=ContinuousRegister(idx=ceilScratch.idx, size=2)))
+        module.add(SMulI32(dst=sgpr(t0), src0=sgpr(t0), src1=cy,
+                           comment="paddedTilesN = RoundUp(tilesN, cy)"))
+        module.add(scalarUInt32DivideAndRemainder(ceilScratch.idx, "WorkGroup1", t0, t0 + 1,
+                                                  tmpVgprRes, kernel["WavefrontSize"],
+                                                  comment="N_tile = WorkGroup1 %% paddedTilesN"))
+        module.add(SCmpGeU32(src0=sgpr(t0 + 1), src1=sgpr("NumWorkGroups1"),
+                             comment="padded if (WorkGroup1 %% paddedTilesN) >= tilesN"))
+        module.add(SCBranchSCC1(labelName=padExitLabel.getLabelName()))
+        module.add(wgmrrEndLabel)
+        module.add(SBranch(labelName=padNoExitLabel.getLabelName()))
+        module.add(padExitLabel)
+        module.add(SEndpgm(comment="padded work-group: exit before any load/barrier"))
+        module.add(padNoExitLabel)
+      self.vgprPool.checkIn(tmpVgpr)
+      return module
     with self.allocTmpSgpr(1, tag="clusterPad_tmpSgpr") as padTmp:
       boundN = "NumWorkGroups1"
       if kernel["GlobalSplitU"] != 0:
@@ -2354,8 +2408,16 @@ class KernelWriterAssembly(KernelWriter):
     early-exit and never issue a ld_bcst, so a full mask makes the load wait for
     the multicast timeout every iteration. Keep only the low validX cols / validY
     rows that map to real tiles (clusterBase = WorkGroup - wg, same for all
-    sharers of a row/column). GSU only scales the Y (WorkGroup1) extent to
-    tilesN*GSU.
+    sharers of a row/column).
+
+    validY is block-local: with GSU-outer packing (GSUWGMRR, which the Solution
+    derivation forces on whenever cy>1 + Multicast) the grid is padded per GSU
+    block, raw_y = gsu_idx*paddedTilesN + N_tile with paddedTilesN = RoundUp(tilesN, cy).
+    A cluster stays within one block, so validY counts real N-tiles from the
+    cluster's in-block base (WorkGroup1 - wg_y) % paddedTilesN. This is perf-only
+    (a wrong mask just falls back to a regular load, never wrong results), and for
+    cy>1 Multicast kernels GSUWGMRR is always compiled on, so the block-local form
+    is used unconditionally without a runtime GSUWGMRR branch.
 
     Writes the reduced-bit masks into maskColSgpr/maskRowSgpr and returns True;
     returns False (no write) for Stream-K or non-cluster, where the caller falls
@@ -2374,25 +2436,44 @@ class KernelWriterAssembly(KernelWriter):
     # grouped-gemm + Multicast is not a supported combination today; if that changes,
     # verify the two uses do not overlap (they write/consume in sequence, so they should
     # not cause failures).
-    with self.allocTmpSgpr(2, tag="reduceMulticastMaskScratch") as rmScratch:
-      tiles = self.sgprs["NumWorkGroups0"]
-      gsuTmp = self.sgprs["NumWorkGroups1"]
-      regStateRes = ContinuousRegister(idx=rmScratch.idx, size=2)
+    with self.allocTmpSgpr(2, tag="reduceMulticastMaskScratch") as rmScratch, \
+         self.allocTmpSgpr(2, alignment=2, tag="reduceMulticastMaskCeil") as ceilScratch:
+      tiles  = self.sgprs["NumWorkGroups0"]
+      padded = self.sgprs["NumWorkGroups1"]
+      # scalarStaticCeilDivide's non-power-of-2 path (cy=3,5,..) emits s_lshl_b64/
+      # s_lshr_b64 on tmpSgprRes, which the assembler requires to be even-aligned,
+      # so use a separate alignment=2 scratch pair for the ceil-divides.
+      regStateRes = ContinuousRegister(idx=ceilScratch.idx, size=2)
       # validX = clamp(tilesM - (WorkGroup0 - wg_x), 0..cx)
       module.add(scalarStaticCeilDivide(qReg=sgpr(tiles), dReg=sgpr("SizeI"), divisor=kernel["MacroTile0"], tmpSgprRes=regStateRes))
       module.add(SSubU32(dst=sgpr(maskColSgpr), src0=sgpr("WorkGroup0"), src1=sgpr(sgprWgX), comment="clusterBaseX"))
       module.add(SSubU32(dst=sgpr(tiles), src0=sgpr(tiles), src1=sgpr(maskColSgpr), comment="tilesM - clusterBaseX"))
       module.add(SMinU32(dst=sgpr(tiles), src0=sgpr(tiles), src1=cx, comment="validX = min(.., cx)"))
       module.add(SBfmB32(dst=sgpr(maskRowSgpr), src0=sgpr(tiles), src1=0, comment="maskRow bits = (1<<validX)-1"))
-      # validY = clamp(tilesN*GSU - (WorkGroup1 - wg_y), 0..cy). WorkGroup1 is the
-      # raw y grid index (grid.y = tilesN*GSU before rounding), so the Y extent
-      # must include the GSU factor.
+      # validY: number of real N-tiles this cluster owns along Y. With GSU-outer
+      # packing (GSUWGMRR, forced on whenever cy>1) the grid is padded per GSU block
+      # to raw_y = gsu_idx*paddedTilesN + N_tile, paddedTilesN = RoundUp(tilesN, cy).
+      # A cluster stays within one block, so validY = clamp(tilesN - clusterBaseN, 0..cy)
+      # where clusterBaseN = (WorkGroup1 - wg_y) % paddedTilesN is the cluster's in-block
+      # N-tile base. (For cy==1 maskA is a single bit, so this reduction is a no-op and
+      # the formula is irrelevant; no runtime GSUWGMRR branch is needed here.)
       module.add(scalarStaticCeilDivide(qReg=sgpr(tiles), dReg=sgpr("SizeJ"), divisor=kernel["MacroTile1"], tmpSgprRes=regStateRes))
-      if kernel["GlobalSplitU"] != 0:
-        module.add(SAndB32(dst=sgpr(gsuTmp), src0=sgpr("GSU"), src1=self.gsuMaskHex(kernel), comment="Restore GSU"))
-        module.add(SMulI32(dst=sgpr(tiles), src0=sgpr(tiles), src1=sgpr(gsuTmp), comment="tilesN * GSU (raw y extent)"))
-      module.add(SSubU32(dst=sgpr(maskColSgpr), src0=sgpr("WorkGroup1"), src1=sgpr(sgprWgY), comment="clusterBaseY"))
-      module.add(SSubU32(dst=sgpr(tiles), src0=sgpr(tiles), src1=sgpr(maskColSgpr), comment="tilesN*GSU - clusterBaseY"))
+      if cy > 1:
+        # paddedTilesN = RoundUp(tilesN, cy)
+        module.add(scalarStaticCeilDivide(qReg=sgpr(padded), dReg=sgpr(tiles), divisor=cy, tmpSgprRes=regStateRes))
+        module.add(SMulI32(dst=sgpr(padded), src0=sgpr(padded), src1=cy, comment="paddedTilesN = RoundUp(tilesN, cy)"))
+        module.add(SSubU32(dst=sgpr(maskColSgpr), src0=sgpr("WorkGroup1"), src1=sgpr(sgprWgY), comment="clusterBaseY"))
+        # clusterBaseN = clusterBaseY % paddedTilesN  (into rmScratch+1; quotient discarded)
+        tmpVgpr = self.vgprPool.checkOut(2, tag="reduceMulticastMask_tmpVgpr")
+        tmpVgprRes = ContinuousRegister(idx=tmpVgpr, size=2)
+        module.add(scalarUInt32DivideAndRemainder(rmScratch.idx, maskColSgpr, padded, rmScratch.idx + 1,
+                                                  tmpVgprRes, kernel["WavefrontSize"],
+                                                  comment="clusterBaseN = clusterBaseY %% paddedTilesN"))
+        self.vgprPool.checkIn(tmpVgpr)
+        module.add(SSubU32(dst=sgpr(tiles), src0=sgpr(tiles), src1=sgpr(rmScratch.idx + 1), comment="tilesN - clusterBaseN"))
+      else:
+        module.add(SSubU32(dst=sgpr(maskColSgpr), src0=sgpr("WorkGroup1"), src1=sgpr(sgprWgY), comment="clusterBaseY"))
+        module.add(SSubU32(dst=sgpr(tiles), src0=sgpr(tiles), src1=sgpr(maskColSgpr), comment="tilesN - clusterBaseY"))
       module.add(SMinU32(dst=sgpr(tiles), src0=sgpr(tiles), src1=cy, comment="validY = min(.., cy)"))
       module.add(SMulI32(dst=sgpr(tiles), src0=sgpr(tiles), src1=cx, comment="validY*cx"))
       module.add(SBfmB32(dst=sgpr(maskColSgpr), src0=sgpr(tiles), src1=0, comment="maskCol bits = (1<<(validY*cx))-1"))

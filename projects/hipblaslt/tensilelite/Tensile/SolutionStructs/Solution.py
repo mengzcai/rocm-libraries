@@ -1053,6 +1053,16 @@ class Solution(collections.abc.Mapping):
       # ClusterBarrier emits SCmp/branch on sgpr("WaveIdx"), which is only allocated when TDM is enabled.
       if state["TDMInst"] != 0 and isaInfoMap[state["ISA"]].asmCaps.get("HasClusterBarrier", False):
         state["ClusterBarrier"] = True
+      # A cluster's cy Y-mates (same M-tile, consecutive raw grid-y) can only share A
+      # when they map to the same K-slice. The default GSU-inner packing
+      # (raw_y = N_tile*GSU + gsu_idx) instead makes them differ in gsu_idx (different K)
+      # whenever GSU >= cy, killing Y-direction multicast. GSU-outer packing
+      # (raw_y = gsu_idx*tilesN + N_tile) keeps the cy Y-mates on the same K, restoring
+      # A-share. Force it on when the cluster has a Y-extent to share along. RR=1 is a
+      # no-op at GSU==1, so this is safe for GSU in {1, >1, -1 adaptive}. The M-axis (B-share)
+      # is untouched by GSU packing, so this never costs B-share.
+      if state["ClusterDim"][1] > 1:
+        state["GlobalSplitUWorkGroupMappingRoundRobin"] = True
 
     # done
     state["AssignedProblemIndependentDerivedParameters"] = True

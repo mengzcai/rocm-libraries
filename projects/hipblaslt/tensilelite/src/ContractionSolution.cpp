@@ -1518,12 +1518,22 @@ namespace TensileLite
         uint32_t GSULimit2 = std::max(1u, (uint32_t)std::floor((float)K / (float)MT2 / 3.0));
         uint32_t gsuVal    = std::min(GSULimit2, std::max(1u, GSULimit1));
 
+        // Cluster launch rounds the tile grid up to clusterDim; the GSUWGMRR path
+        // additionally rounds each GSU block's N-tile count up to clusterDim.y
+        // (see generateSingleCall). The launched grid is therefore larger than the
+        // bare tile count, so the grid-size limits below must use the padded counts
+        // or autoGSU could pick a GSU that overflows the launch grid.
+        uint32_t clusterTilesX = std::max(1u, (uint32_t)std::ceil(static_cast<float>(M) / MT0));
+        uint32_t clusterTilesY = std::max(1u, (uint32_t)std::ceil(static_cast<float>(N) / MT1));
+        clusterTilesX = RoundUpToMultiple(clusterTilesX, (uint32_t)sizeMapping.clusterDim.x);
+        clusterTilesY = RoundUpToMultiple(clusterTilesY, (uint32_t)sizeMapping.clusterDim.y);
+
         // WorkgroupNumberCheck
 #define MAX_WORKGROUP_NUMBER 16777216
         if(gsuVal > 1)
             gsuVal = std::min(gsuVal,
-                         static_cast<uint32_t>(MAX_WORKGROUP_NUMBER / std::ceil(static_cast<float>(M) / MT0)
-                             / std::ceil(static_cast<float>(N) / MT1) / B));
+                         static_cast<uint32_t>(MAX_WORKGROUP_NUMBER / clusterTilesX
+                             / clusterTilesY / B));
 
         // GlobalSplitUCheckMinK
         if(gsuVal > 1)
@@ -1543,10 +1553,9 @@ namespace TensileLite
                 gsuVal = synchronizerUsage > (409600 * 16) ? 1 : gsuVal;
         }
 
-        // Avoid selecting a gsu value that would make launch grid over the limit
-        uint32_t tiles0        = CeilDivide(M, MT0);
-        uint32_t tiles1        = CeilDivide(N, MT1);
-        uint32_t tiles         = tiles0 * tiles1 * B;
+        // Avoid selecting a gsu value that would make launch grid over the limit.
+        // Use the cluster-padded tile counts so the estimate matches the launched grid.
+        uint32_t tiles         = clusterTilesX * clusterTilesY * B;
         uint32_t workGroupSize = sizeMapping.workGroupSize.x * sizeMapping.workGroupSize.y
                                  * sizeMapping.workGroupSize.z;
         uint32_t maxGsuValue = (std::numeric_limits<uint32_t>::max() / workGroupSize) / tiles;
@@ -1881,6 +1890,22 @@ namespace TensileLite
 
         uint32_t autoGsuVal = calculateAutoGSU(problem, &hardware);
         uint32_t gsu = problem.getParams().gsu() > 0 ? problem.getParams().gsu() : autoGsuVal;
+
+        // GSU-outer packing (GSUWGMRR) lays out the grid-y index as
+        // raw_y = gsu_idx*tilesN + N_tile. A workgroup cluster groups clusterDim.y
+        // consecutive raw_y values, so unless each GSU block's N-tile count is a
+        // multiple of clusterDim.y, a cluster straddles two GSU blocks and its
+        // Y-mates land on different K-slices, defeating A-matrix multicast. Pad
+        // each block's N-tile count up to clusterDim.y *before* folding in GSU so
+        // clusters stay within one block; the padded N-tiles early-exit in the
+        // kernel prologue. The matching kernel-side decode divides by this padded
+        // tilesN (see GSU.py graWorkGroup). Stream-K uses its own 1-D grid.
+        bool clusterYShare = (sizeMapping.clusterDim.y > 1) && (sizeMapping.streamK == 0);
+        bool gsuwgmrrOn    = problem.getParams().gsuwgmrr()
+                            || sizeMapping.globalSplitUWorkGroupMappingRoundRobin;
+        if(clusterYShare && gsuwgmrrOn)
+            rv.numWorkGroups.y = RoundUpToMultiple(rv.numWorkGroups.y, sizeMapping.clusterDim.y);
+
         if(gsu > 0)
             rv.numWorkGroups.y *= gsu;
 

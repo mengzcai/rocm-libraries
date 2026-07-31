@@ -30,9 +30,9 @@ from rocisa.instruction import SAddCU32, SAddU32, SAndB32, SLoadB32, SStoreB32, 
     SCmpLeI32, VCmpGEI32, SSubI32, SCBranchSCC0, VMovB32, SLShiftLeftB32, SWaitCnt, SWaitXCnt, SBarrier, \
     SNop, SSleep, VAddF32, VAddI32, VReadfirstlaneB32, SMulHIU32, VAddPKF32, VCndMaskB32, SAtomicDec, \
     SCmpEQU64, BufferStoreB32, BufferLoadB32, VMovB64, FlatAtomicDecU32, VAddCOU32, VAddCCOU32
-from rocisa.functions import scalarStaticMultiply64, scalarUInt32DivideAndRemainder, vectorStaticMultiply
+from rocisa.functions import scalarStaticMultiply64, scalarUInt32DivideAndRemainder, vectorStaticMultiply, scalarStaticCeilDivide
 
-from ..Common import ceilDivide, log2, print2, INDEX_CHARS
+from ..Common import ceilDivide, log2, print2, INDEX_CHARS, clusterEnabled
 from ..Component import Component
 from ..AsmStoreState import StoreState, VectorDataTypes
 from ..AsmAddressCalculation import AddrCalculation
@@ -371,7 +371,30 @@ class GSUOn(GSU):
             module.add(gsuwgmrrLabel)
             # gsuSumIdx = wg1 / numWg1
             # wg1       = wg1 % numWg1
-            module.add(scalarUInt32DivideAndRemainder("GSUSumIdx", "WorkGroup1", "NumWorkGroups1", "WorkGroup1", tmpVgprRes, kernel["WavefrontSize"]))
+            # With a Y-extent cluster (clusterDim.y > 1), the host pads each GSU
+            # block's N-tile count up to clusterDim.y so a cluster never straddles
+            # two GSU blocks (see ContractionSolution generateSingleCall). The grid
+            # was laid out with that padded block length, so decode with the same
+            # padded divisor; otherwise a cluster's Y-mates would decode to the
+            # wrong (gsu_idx, N_tile) and multicast would target wrong partners.
+            cy = kernel["ClusterDim"][1]
+            if clusterEnabled(kernel["ClusterDim"]) and cy > 1 and kernel["StreamK"] == 0:
+                # paddedTilesN = RoundUp(tilesN, cy). scalarStaticCeilDivide's
+                # non-power-of-2 path (cy=3,5,..) emits s_lshl_b64/s_lshr_b64 on its
+                # scratch, which the assembler requires to be an even-aligned pair, so
+                # allocate the 2-reg scratch with alignment=2 and a separate quotient reg.
+                with writer.allocTmpSgpr(2, alignment=2, tag="GSUWGMRR_ceilScratch") as padRes, \
+                     writer.allocTmpSgpr(1, tag="GSUWGMRR_paddedTilesN") as padQuotAlloc:
+                    padQuot = padQuotAlloc.idx
+                    module.add(scalarStaticCeilDivide(qReg=sgpr(padQuot),
+                                                      dReg=sgpr("NumWorkGroups1"),
+                                                      divisor=cy,
+                                                      tmpSgprRes=ContinuousRegister(idx=padRes.idx, size=2)))
+                    module.add(SMulI32(dst=sgpr(padQuot), src0=sgpr(padQuot),
+                                       src1=cy, comment="paddedTilesN = RoundUp(tilesN, cy)"))
+                    module.add(scalarUInt32DivideAndRemainder("GSUSumIdx", "WorkGroup1", padQuot, "WorkGroup1", tmpVgprRes, kernel["WavefrontSize"]))
+            else:
+                module.add(scalarUInt32DivideAndRemainder("GSUSumIdx", "WorkGroup1", "NumWorkGroups1", "WorkGroup1", tmpVgprRes, kernel["WavefrontSize"]))
             module.add(gsuwgmrrLabelEnd)
         writer.vgprPool.checkIn(tmpVgpr)
         module.add(SMovB32(dst=sgpr("GSULog2BpeC"), src=log2(int(writer.states.bpr * kernel["ProblemType"]["DestDataType"].numRegisters()))))
