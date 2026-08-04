@@ -6697,6 +6697,9 @@ class KernelWriter(metaclass=abc.ABCMeta):
                                # Cluster-barrier handshake insertion in Gfx1250Backend
                                # (kernel-scope at every OptLevel when set).
                                "ClusterBarrier": bool(kernel.get("ClusterBarrier", False)),
+                               # InsertLargeGap: odd-WGx s_sleep ~2500cyc between cluster
+                               # signal-3 and wait-3, emitted by InsertClusterBarrierPass.
+                               "InsertLargeGap": bool(kernel.get("InsertLargeGap", False)),
                                # PrefetchGlobalRead (PGR) passed to InsertClusterBarrierPass.
                                # Gates Rule 3 (`LCL <= PGR` skip) and Rule 4 (`LCL == PGR+1`
                                # skip in fresh-gate mode; inherits upstream `LCL == PGR` cmp

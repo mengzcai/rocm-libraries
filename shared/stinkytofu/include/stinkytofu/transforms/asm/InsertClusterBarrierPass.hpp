@@ -31,6 +31,7 @@ class Pass;
 
 STINKYTOFU_EXPORT std::unique_ptr<Pass> createInsertClusterBarrierPass(bool isKernelScope = true,
                                                                        int pgrValue = 1,
-                                                                       int plrValue = 1);
+                                                                       int plrValue = 1,
+                                                                       bool insertLargeGap = false);
 
 }  // namespace stinkytofu

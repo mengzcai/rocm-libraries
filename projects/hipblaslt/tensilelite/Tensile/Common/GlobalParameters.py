@@ -626,6 +626,10 @@ defaultBenchmarkCommonParameters = [
     # requested, instead of waiting the standard ld_bcst timer. False (default) = standard
     # timeout. Experimental: probes whether early-timeout affects dur / timeout counts.
     {"MulticastEarlyTimeout": [False]},
+    # InsertLargeGap — experimental: before every tensor_load_to_lds, make odd-WGx WGs sleep
+    # ~2500 cycles (s_sleep) so cluster members deliberately reach the multicast load out of
+    # sync. Probes how inter-WG arrival skew drives multicast timeout. False (default) = no gap.
+    {"InsertLargeGap": [False]},
     {"HalfPLR": [0]},
     {"TDMIterateMode": [0]}
 ]

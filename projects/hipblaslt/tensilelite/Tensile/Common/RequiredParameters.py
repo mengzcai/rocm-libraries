@@ -167,4 +167,6 @@ def getRequiredParametersMin() -> set:
         'ClusterDim',
         'ClusterMaskReduce',
         'MulticastEarlyTimeout',
+        'ClusterBarrier',
+        'InsertLargeGap',
     })

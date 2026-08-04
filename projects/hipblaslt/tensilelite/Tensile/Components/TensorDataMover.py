@@ -4,7 +4,9 @@ from ..Common import INDEX_CHARS
 from typing import Mapping, Optional
 from rocisa.code import Module
 from rocisa.instruction import SMovB32, SMovB64, SOrB32, SAndB32, SLShiftLeftB32, SLShiftLeftB64, \
-    SLShiftRightB32, SAddU32, SAddCU32, SMulI32, TensorLoadToLds, VReadfirstlaneB32
+    SLShiftRightB32, SAddU32, SAddCU32, SMulI32, TensorLoadToLds, VReadfirstlaneB32, \
+    SCmpEQU32, SCBranchSCC1, SSleep
+from rocisa.code import Label
 from rocisa.container import sgpr, vgpr, RegisterContainer, MemTokenData
 from rocisa.functions import scalarMultiply64Bpe
 from math import log2, ceil, prod
@@ -215,7 +217,10 @@ class TensorDataMoverLoad(TensorDataMover):
             #TODO: support stagger U
         return mod
 
-    def issueLoad(self, group0: int | str, group1: int | str, group2: Optional[int | str], group3: Optional[int | str]) -> Module:
+    def issueLoad(self, group0: int | str, group1: int | str, group2: Optional[int | str], group3: Optional[int | str], writer=None, kernel=None) -> Module:
+        # NOTE: InsertLargeGap is now emitted by the stinkytofu InsertClusterBarrierPass
+        # (between s_barrier_signal -3 and s_barrier_wait -3), NOT here — a gap emitted
+        # before the barrier would be absorbed by the cluster wait. See Gfx1250Backend.
         mod = Module("tensor load")
         if len(self.mem_token) > 1:
             comment = f"sync LDS {self.mem_token}"

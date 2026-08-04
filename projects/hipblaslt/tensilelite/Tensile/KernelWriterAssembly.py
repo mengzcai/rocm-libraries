@@ -11347,7 +11347,7 @@ class KernelWriterAssembly(KernelWriter):
         isIterA = isIterA or kernel.get("_TDMIterateModeB", False)
       tdmAGroup2 = "tdmAGroup2" if isIterA else None
       tdmAGroup3 = "tdmAGroup3" if isIterA else None
-      imod.middle.add(comp.issueLoad("tdmAGroup0", "tdmAGroup1", tdmAGroup2, tdmAGroup3))
+      imod.middle.add(comp.issueLoad("tdmAGroup0", "tdmAGroup1", tdmAGroup2, tdmAGroup3, writer=self, kernel=kernel))
       # TODO: Embed metadata TDM issueLoad here (mirrors non-TDM pattern where globalReadBody(tP["tpsMetadata"])
       # is called after globalReadBody(tP) for the sparse tensor). This would allow _splitTdmLoad in SIA.py
       # to extract and defer both A and metadata TDM loads together, eliminating the separate globalReadMetadata
@@ -11395,11 +11395,11 @@ class KernelWriterAssembly(KernelWriter):
             imod.middle.add(SCSelectB32(sgpr(h1), 0, sgpr(h1), "clamp H1 to 0"))
             imod.middle.add(comp.setTensorDim1(group1, h1, self))
             comp.setMemToken([self.states.memTokenLdsSplit[tdmParity][1]])
-            imod.middle.add(comp.issueLoad("tdmAGroup0", "tdmAGroup1", tdmAGroup2, tdmAGroup3))
+            imod.middle.add(comp.issueLoad("tdmAGroup0", "tdmAGroup1", tdmAGroup2, tdmAGroup3, writer=self, kernel=kernel))
             imod.middle.add(comp.setTensorDim1(group1, h0, self))
         else:
           comp.setMemToken([self.states.memTokenLdsSplit[tdmParity][1]])
-          imod.middle.add(comp.issueLoad("tdmAGroup0", "tdmAGroup1", tdmAGroup2, tdmAGroup3))
+          imod.middle.add(comp.issueLoad("tdmAGroup0", "tdmAGroup1", tdmAGroup2, tdmAGroup3, writer=self, kernel=kernel))
       return imod
 
     if tc == "MXSA" and kernel["enableTDMA"]:
@@ -11450,7 +11450,7 @@ class KernelWriterAssembly(KernelWriter):
         isIterB = kernel.get("_TDMIterateModeB", False)
         tdmBGroup2 = "tdmBGroup2" if isIterB else None
         tdmBGroup3 = "tdmBGroup3" if isIterB else None
-        imod.middle.add(comp.issueLoad("tdmBGroup0", "tdmBGroup1", tdmBGroup2, tdmBGroup3))
+        imod.middle.add(comp.issueLoad("tdmBGroup0", "tdmBGroup1", tdmBGroup2, tdmBGroup3, writer=self, kernel=kernel))
         # TODO: Embed metadata TDM issueLoad here (mirrors non-TDM pattern where globalReadBody(tP["tpsMetadata"])
         # is called after globalReadBody(tP) for the sparse tensor). This would allow _splitTdmLoad in SIA.py
         # to extract and defer both B and metadata TDM loads together, eliminating the separate globalReadMetadata
@@ -11464,7 +11464,7 @@ class KernelWriterAssembly(KernelWriter):
           imod.middle.add(SAddU32(sgpr(f"tdm{tc}Group0+2"), sgpr(f"tdm{tc}Group0+2"), sgpr(globalIncSgprName)))
           imod.middle.add(SAddCU32(sgpr(f"tdm{tc}Group0+3"), sgpr(f"tdm{tc}Group0+3"), 0, f"tdm{tc} split carry"))
           comp.setMemToken([self.states.memTokenLdsSplit[tdmParity][1]])
-          imod.middle.add(comp.issueLoad("tdmBGroup0", "tdmBGroup1", tdmBGroup2, tdmBGroup3))
+          imod.middle.add(comp.issueLoad("tdmBGroup0", "tdmBGroup1", tdmBGroup2, tdmBGroup3, writer=self, kernel=kernel))
       return imod
 
     if tc == "MXSB" and kernel["enableTDMB"]:

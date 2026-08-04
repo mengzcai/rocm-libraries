@@ -71,6 +71,19 @@ constexpr const char* kTailLoopMarker = "Tail Loop";
 /// Rule 4 owns the per-load handshake emission.
 constexpr bool kRule3Enabled = false;
 
+/// Master switch for Rule 1 (the gsu1 label signal-only handshake at
+/// `label_GSU_1:`). Disabled: that far-upstream signal sits dozens of segments
+/// before the prologue's first tensor_load, so a slow WG can lag past the 1K
+/// ld_bcst timer before reaching the wait. The Rule-4 prologue-race fix now
+/// emits a compact signal+wait right at that load instead.
+constexpr bool kRule1Enabled = false;
+
+/// Master switch for Rule 5 (the tail-loop 5a signal / 5b wait pair). Disabled:
+/// Rule 4's per-load handshake (extended to segment-local-wait-less loads) now
+/// covers the tail load too, so the split 5a/5b pair is redundant and would
+/// double-emit. See the prologue-race fix in the Rule-4 scan.
+constexpr bool kRule5Enabled = false;
+
 /// Master switch for Rule 4's "mode (c)" -- the always-ungated signal
 /// handshake. When true, `insertClusterBarrierHandshakeBefore` emits a
 /// WaveIdx-gated `s_barrier_signal -3` followed by a bare `s_barrier_wait -3`
@@ -356,6 +369,42 @@ void insertClusterBarrierSignalOnlyBefore(IRBase* anchor, AsmIRBuilder& irBuilde
     static const HwInstDesc labelMCID{
         GFX::LABEL, GFX::LABEL, 0, 0, 0, "LABEL", makeFlagSet({InstFlag::IF_HasSideEffect})};
     StinkyInstruction* lblInst = irBuilder.create(&labelMCID, anchor);
+    lblInst->addModifier<LabelData>(LabelData{labelName, /*alignment=*/1});
+}
+
+/// InsertLargeGap: emit, immediately before `anchor`, a guard that makes only
+/// odd-WGx workgroups sleep ~2500 cycles (s_sleep 39 ~= 64*39). Placed by the
+/// caller BETWEEN the cluster `s_barrier_signal -3` and `s_barrier_wait -3`, so
+/// after every WG has signalled, the even WGs pass the wait and issue their
+/// multicast tensor_load while the odd WGs are still asleep -> deliberate
+/// inter-WG arrival skew at the ld_bcst tracker. Uses s_bitcmp1_b32 (bit 0 of
+/// WorkGroup0) to set SCC = odd, then s_cbranch_scc0 skips the sleep on even WGx.
+/// No scratch sgpr needed (mirrors Tensile's own parity check idiom).
+void insertLargeGapBefore(IRBase* anchor, AsmIRBuilder& irBuilder, GfxArchID archId) {
+    const std::string labelName = std::string("skipLargeGap_") + makeRandomHash();
+    const HwInstDesc* bitcmpDesc = getMCIDByUOp(GFX::s_bitcmp1_b32, archId);
+    const HwInstDesc* brDesc = getMCIDByUOp(GFX::s_cbranch_scc0, archId);
+    const HwInstDesc* sleepDesc = getMCIDByUOp(GFX::s_sleep, archId);
+    assert(bitcmpDesc && brDesc && sleepDesc &&
+           "InsertLargeGap opcodes are not supported on this architecture");
+
+    StinkyInstruction* bitcmpInst = irBuilder.create(bitcmpDesc, anchor);
+    bitcmpInst->addSrcReg(makeSymbolicSgpr("sgprWorkGroup0"));
+    bitcmpInst->addSrcReg(StinkyRegister(0));  // test bit 0 -> SCC = (WGx odd)
+    bitcmpInst->addModifier<CommentData>(CommentData{"InsertLargeGap: SCC = WGx odd?"});
+
+    StinkyInstruction* brInst = irBuilder.create(brDesc, anchor);
+    brInst->addSrcReg(StinkyRegister(labelName));
+    brInst->addModifier<LabelData>(LabelData{labelName});
+    brInst->addModifier<CommentData>(CommentData{"skip gap on even WGx"});
+
+    StinkyInstruction* sleepInst = irBuilder.create(sleepDesc, anchor);
+    sleepInst->addSrcReg(StinkyRegister(39));  // ~64*39 = 2496 cycles
+    sleepInst->addModifier<CommentData>(CommentData{"InsertLargeGap: odd WGx sleeps ~2500 cycles"});
+
+    static const HwInstDesc gapLabelMCID{
+        GFX::LABEL, GFX::LABEL, 0, 0, 0, "LABEL", makeFlagSet({InstFlag::IF_HasSideEffect})};
+    StinkyInstruction* lblInst = irBuilder.create(&gapLabelMCID, anchor);
     lblInst->addModifier<LabelData>(LabelData{labelName, /*alignment=*/1});
 }
 
@@ -647,7 +696,7 @@ void insertClusterBarrierWaitBefore(IRBase* anchor, const char* comment, AsmIRBu
 /// \p pgrValue and \p lclPreDecrement are consulted by mode (b) only.
 void insertClusterBarrierHandshakeBefore(IRBase* anchor, AsmIRBuilder& irBuilder, GfxArchID archId,
                                          int pgrValue, StinkyInstruction* liveLclCmp,
-                                         int lclPreDecrement) {
+                                         int lclPreDecrement, bool insertLargeGap = false) {
     if (kRule4ForceUngatedSignalMode) {
         // Mode (c): always-ungated signal. Emit the WaveIdx-gated
         // `s_barrier_signal -3` then a bare `s_barrier_wait -3` for every
@@ -658,6 +707,9 @@ void insertClusterBarrierHandshakeBefore(IRBase* anchor, AsmIRBuilder& irBuilder
         // above clobbers that SCC, so a clone of the cmp is re-emitted
         // AFTER the bare wait (which has no SCC side effect) to rebuild it.
         insertClusterBarrierSignalOnlyBefore(anchor, irBuilder, archId);
+        // InsertLargeGap sits BETWEEN the cluster signal and wait: odd WGx sleeps
+        // so even WGs pass the wait and issue the multicast load first.
+        if (insertLargeGap) insertLargeGapBefore(anchor, irBuilder, archId);
         insertClusterBarrierWaitBefore(anchor, "cluster barrier wait", irBuilder, archId);
         if (liveLclCmp != nullptr) {
             const HwInstDesc* restoreDesc = liveLclCmp->getHwInstDesc();
@@ -806,8 +858,10 @@ class InsertClusterBarrierPassImpl : public Pass {
    public:
     static char ID;
 
-    InsertClusterBarrierPassImpl(bool isKernelScope, int pgrValue, int plrValue)
-        : isKernelScope_(isKernelScope), pgrValue_(pgrValue), plrValue_(plrValue) {}
+    InsertClusterBarrierPassImpl(bool isKernelScope, int pgrValue, int plrValue,
+                                 bool insertLargeGap)
+        : isKernelScope_(isKernelScope), pgrValue_(pgrValue), plrValue_(plrValue),
+          insertLargeGap_(insertLargeGap) {}
 
     const char* getName() const override {
         return "Insert Cluster Barrier";
@@ -867,7 +921,18 @@ class InsertClusterBarrierPassImpl : public Pass {
 
                 StinkyInstruction* trigger =
                     findPrecedingWorkgroupBarrierWaitInSegment(segBegin, inst);
-                if (trigger == nullptr) continue;
+                if (trigger == nullptr) {
+                    // Prologue-race fix: the prologue's first tensor_load has NO
+                    // s_barrier_wait -1 in its own segment (the GSU==1 Rule-1 signal
+                    // and the Rule-2 wait sit dozens of labels/segments apart, so a
+                    // slow WG can lag past the 1K ld_bcst timer). Anchor the handshake
+                    // on the LOAD itself so a compact WaveIdx-gated signal-3 + wait-3
+                    // is emitted immediately before it (mode c, liveLclCmp = nullptr).
+                    if (isImmediatelyPrecededByClusterBarrierWait(inst)) continue;
+                    if (!seenTriggers.insert(inst).second) continue;
+                    pending.emplace_back(inst, BasicBlock::iterator(inst), nullptr, 0);
+                    continue;
+                }
                 // Dedup: multiple loads can share the same anchor wait;
                 // only the first one queues an emission.
                 if (!seenTriggers.insert(trigger).second) continue;
@@ -1098,17 +1163,19 @@ class InsertClusterBarrierPassImpl : public Pass {
             for (const auto& [trigger, nextIt, liveLclCmp, lclPreDecrement] : pending) {
                 IRBase* anchor = (nextIt != bb.end()) ? nextIt.getNodePtr() : nullptr;
                 insertClusterBarrierHandshakeBefore(anchor, irBuilder, archId, pgrValue_,
-                                                    liveLclCmp, lclPreDecrement);
+                                                    liveLclCmp, lclPreDecrement, insertLargeGap_);
                 (void)trigger;  // queued for ordering only; insertion uses `anchor`
             }
-            for (IRBase* anchor : gsu1Anchors) {
-                insertLoopCounterLGatedClusterBarrierSignalBefore(
-                    anchor, irBuilder, archId,
-                    /*cmpUOp=*/GFX::s_cmp_eq_u32,
-                    /*skipWhenScc1Imm=*/0,
-                    /*cmpComment=*/"gate: only signal when LoopCounterL != 0",
-                    /*branchComment=*/"skip cluster barrier when LoopCounterL == 0",
-                    /*workgroupSyncWaitComment=*/"sync workgroup before cluster signal");
+            if (kRule1Enabled) {
+                for (IRBase* anchor : gsu1Anchors) {
+                    insertLoopCounterLGatedClusterBarrierSignalBefore(
+                        anchor, irBuilder, archId,
+                        /*cmpUOp=*/GFX::s_cmp_eq_u32,
+                        /*skipWhenScc1Imm=*/0,
+                        /*cmpComment=*/"gate: only signal when LoopCounterL != 0",
+                        /*branchComment=*/"skip cluster barrier when LoopCounterL == 0",
+                        /*workgroupSyncWaitComment=*/"sync workgroup before cluster signal");
+                }
             }
             if (setupNewTileEnabled) {
                 IRBase* anchor = setupNewTileAnchorIt.getNodePtr();
@@ -1123,13 +1190,13 @@ class InsertClusterBarrierPassImpl : public Pass {
                     setupNewTileNeedsWorkgroupSync ? "workgroup sync" : nullptr);
             }
             // Rule 5a -- signal-only after the tail loop's preceding workgroup wait.
-            if (tailWait != nullptr) {
+            if (kRule5Enabled && tailWait != nullptr) {
                 IRBase* anchor =
                     (tailWaitNextIt != bb.end()) ? tailWaitNextIt.getNodePtr() : nullptr;
                 insertClusterBarrierSignalOnlyBefore(anchor, irBuilder, archId);
             }
             // Rule 5b -- bare cluster wait immediately before the tail load.
-            if (tailTL != nullptr) {
+            if (kRule5Enabled && tailTL != nullptr) {
                 insertClusterBarrierWaitBefore(tailTL, "cluster barrier wait", irBuilder, archId);
             }
         }
@@ -1157,6 +1224,7 @@ class InsertClusterBarrierPassImpl : public Pass {
     const bool isKernelScope_;
     const int pgrValue_;
     const int plrValue_;
+    const bool insertLargeGap_;
 };
 
 char InsertClusterBarrierPassImpl::ID = 0;
@@ -1164,8 +1232,9 @@ char InsertClusterBarrierPassImpl::ID = 0;
 }  // namespace
 
 std::unique_ptr<Pass> createInsertClusterBarrierPass(bool isKernelScope, int pgrValue,
-                                                     int plrValue) {
-    return std::make_unique<InsertClusterBarrierPassImpl>(isKernelScope, pgrValue, plrValue);
+                                                     int plrValue, bool insertLargeGap) {
+    return std::make_unique<InsertClusterBarrierPassImpl>(isKernelScope, pgrValue, plrValue,
+                                                          insertLargeGap);
 }
 
 }  // namespace stinkytofu

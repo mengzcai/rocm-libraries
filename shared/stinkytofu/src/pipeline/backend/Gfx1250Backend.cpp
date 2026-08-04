@@ -159,7 +159,8 @@ bool buildGfx1250Pipeline(PassManager& pm, StinkyAsmModule& module, const PassBu
     if (moduleOptions.ClusterBarrier) {
         pm.addPass(createInsertClusterBarrierPass(/*isKernelScope=*/true,
                                                   /*pgrValue=*/moduleOptions.PrefetchGlobalRead,
-                                                  /*plrValue=*/moduleOptions.PrefetchLocalRead));
+                                                  /*plrValue=*/moduleOptions.PrefetchLocalRead,
+                                                  /*insertLargeGap=*/moduleOptions.InsertLargeGap));
     }
 
     // Build the CFG after the flat region splice-backs so RegionClonePass can match its

@@ -1132,6 +1132,13 @@ validParameters = { # we need to make sure this matches develop
     # Set descriptor Group1 bit 21 (early_timeout) on TDM-multicast loads (True) vs standard
     # timeout (False). Only affects Multicast kernels.
     "MulticastEarlyTimeout": [False, True],
+    # Insert a ~2500-cycle s_sleep on odd-WGx WGs before each tensor_load_to_lds (True) to
+    # deliberately desync cluster members; False = no gap. Only affects Multicast kernels.
+    "InsertLargeGap": [False, True],
+    # Cluster-wide barrier for TDM multicast sync. Normally derived (auto-True when
+    # TDMInst!=0 + HasClusterBarrier); exposing it here lets a yaml force it False to
+    # measure the barrier's perf contribution. -1 = keep the derived default.
+    "ClusterBarrier": [-1, False, True],
     # Enable PLR 0.5 to save vgprs
     # 0: Disabled
     # 1: Use PLR 0.5 for A

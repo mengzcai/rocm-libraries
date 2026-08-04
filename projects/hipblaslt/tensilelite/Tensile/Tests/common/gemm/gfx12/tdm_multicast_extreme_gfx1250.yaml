@@ -17,7 +17,7 @@
 TestParameters:
   marks: [skip-gfx900, skip-gfx906, skip-gfx908, skip-gfx90a, skip-gfx940, skip-gfx941, skip-gfx942, skip-gfx950, skip-gfx1010, skip-gfx1011, skip-gfx1012, skip-gfx1030, skip-gfx1100, skip-gfx1101, skip-gfx1102, skip-gfx1200, skip-gfx1201] # not supported by arch
 GlobalParameters:
-  SyncsPerBenchmark: 0
+  SyncsPerBenchmark: 1 # 原本=0會讓 tensilelite us: nan
   NumElementsToValidate: 1 #至少要1才會跑perf counter
   KernelTime: True
   BoundsCheck: 0
@@ -106,8 +106,10 @@ BenchmarkProblems:
         - DirectToVgprB: [False]
         - WavefrontSize: [32]
         - ClusterDim: [[4, 4]]
-        - ClusterMaskReduce: [False, True]
+        - ClusterMaskReduce: [True] #只測LargeGap0/1 + ET0/1
         - MulticastEarlyTimeout: [False, True]
+        - ClusterBarrier: [True]
+        - InsertLargeGap: [False, True]
       BenchmarkForkParameters:
       JoinParameters:
       BenchmarkJoinParameters:
@@ -134,7 +136,7 @@ BenchmarkProblems:
           - Exact: [1280, 1280, 1, 8192] # 4x4=16 real, #pad=0, 32 iters (reference: mask identical RED/NORED)
           - Exact: [1280, 1280, 1,  4096] # 4x4=16 real, #pad=0, 16 iters
 
-          - Exact: [2560, 2560, 1,  4096] # 4x4=16 real, #pad=0, 16 iters
+          #- Exact: [2560, 2560, 1,  4096] # 4x4=16 real, #pad=0, 16 iters
 
     # ==================================================================================
     # SINGLE-WAVE probe (WaveGroup=[1,1] => 1 wave/WG). Isolates Q3: "can the 4 waves
@@ -143,68 +145,68 @@ BenchmarkProblems:
     # each other). Here each WG is a single wave, taking the NumWaves==1 else-branch
     # (MulticastMaskA/B, no parity split). If single-wave self-only timeout == 0 but the
     # 4-wave self-only timeout != 0, timeout is an intra-WG inter-wave effect, NOT a mask bug.
-    - # BenchmarkProblemSizeGroup - single-wave
-      InitialSolutionParameters:
-      BenchmarkCommonParameters:
-        - KernelLanguage: ["Assembly"]
-      ForkParameters:
-        - UseSgprForGRO: [0]
-        - ForceDisableShadowInit: [true]
-        - MatrixInstruction:
-          - [16, 16, 128, 1,  1,   1, 1,  1,1 ]  # MT16,   1 wave/WG
-          - [16, 16, 128, 1,  1,   2, 2,  1,1 ]  # MT32,   1 wave/WG
-          - [16, 16, 128, 1,  1,   4, 4,  1,1 ]  # MT64,   1 wave/WG
-          - [16, 16, 128, 1,  1,   8, 8,  1,1 ]  # MT128x128, 1 wave/WG
-        - DepthU: [128,256]
-        - ClusterLocalRead: [0]
-        - TransposeLDS: [-1]
-        - LdsPadA: [-1]
-        - LdsPadB: [-1]
-        - LdsPadMXSA: [0]
-        - LdsPadMXSB: [0]
-        - LdsBlockSizePerPadA: [-1]
-        - LdsBlockSizePerPadB: [-1]
-        - LdsBlockSizePerPadMXSA: [0]
-        - LdsBlockSizePerPadMXSB: [0]
-        - LdsPadMetadata: [0]
-        - LDSTrInst: [False]
-        - TDMInst: [3]
-        - StaggerU: [0]
-        - ScheduleIterAlg: [0]
-        - PrefetchLocalRead: [1]
-        - PrefetchGlobalRead: [1]
-        - StoreRemapVectorWidth: [0]
-        - GlobalSplitU: [1]
-        - GlobalSplitUAlgorithm: [MultipleBuffer]
-        - GlobalReadVectorWidthA: [-1]
-        - GlobalReadVectorWidthB: [-1]
-        - VectorWidthA: [1]
-        - VectorWidthB: [1]
-        - LocalReadVectorWidth: [-1]
-        - 1LDSBuffer: [0]
-        - SourceSwap: [false]
-        - DirectToVgprSparseMetadata: [false]
-        - WorkGroupMapping: [1]
-        - StoreVectorWidth: [-1]
-        - DirectToVgprA: [False]
-        - DirectToVgprB: [False]
-        - WavefrontSize: [32]
-        - ClusterDim: [[4, 4]]
-        - ClusterMaskReduce: [False, True]
-        - MulticastEarlyTimeout: [False, True]
-      BenchmarkForkParameters:
-      JoinParameters:
-      BenchmarkJoinParameters:
-      BenchmarkFinalParameters:
-        - ProblemSizes:
-          # MT64x64: 1x1 real -> 4x4 padded (#pad=15) single-wave, extreme + K scaling
-          - Exact: [64, 64, 1, 8192]    # 1x1 real, #pad=15, 32 iters, 1 wave/WG  <-- Q3 probe
-          - Exact: [256, 256, 1, 8192]  # 4x4=16 real, #pad=0, single-wave baseline (RED==NORED)
-          # MT128x128: 1x1 real -> 4x4 padded single-wave
-          - Exact: [128, 128, 1, 8192]  # 1x1 real, #pad=15, 32 iters, 1 wave/WG
-          - Exact: [512, 512, 1, 8192]  # 4x4=16 real, #pad=0, single-wave baseline
-
-          - Exact: [160, 320, 1, 4096]  # 1x1 real -> 4x4 padded, #pad=15, 32 iters  <-- key probe (4-wave WG)
-          - Exact: [320, 320, 1, 4096]  # 1x1 real -> 4x4 padded, #pad=15, 16 iters  (K-scaling check)
-          - Exact: [640, 640, 1, 4096]  # 1x1 real -> 4x4 padded, #pad=15, 32 iters  <-- key probe (4-wave WG)
-          - Exact: [1280, 1280, 1, 4096]  # 1x1 real -> 4x4 padded, #pad=15, 16 iters  (K-scaling check)
+#    - # BenchmarkProblemSizeGroup - single-wave
+#      InitialSolutionParameters:
+#      BenchmarkCommonParameters:
+#        - KernelLanguage: ["Assembly"]
+#      ForkParameters:
+#        - UseSgprForGRO: [0]
+#        - ForceDisableShadowInit: [true]
+#        - MatrixInstruction:
+#          - [16, 16, 128, 1,  1,   1, 1,  1,1 ]  # MT16,   1 wave/WG
+#          - [16, 16, 128, 1,  1,   2, 2,  1,1 ]  # MT32,   1 wave/WG
+#          - [16, 16, 128, 1,  1,   4, 4,  1,1 ]  # MT64,   1 wave/WG
+#          - [16, 16, 128, 1,  1,   8, 8,  1,1 ]  # MT128x128, 1 wave/WG
+#        - DepthU: [128,256]
+#        - ClusterLocalRead: [0]
+#        - TransposeLDS: [-1]
+#        - LdsPadA: [-1]
+#        - LdsPadB: [-1]
+#        - LdsPadMXSA: [0]
+#        - LdsPadMXSB: [0]
+#        - LdsBlockSizePerPadA: [-1]
+#        - LdsBlockSizePerPadB: [-1]
+#        - LdsBlockSizePerPadMXSA: [0]
+#        - LdsBlockSizePerPadMXSB: [0]
+#        - LdsPadMetadata: [0]
+#        - LDSTrInst: [False]
+#        - TDMInst: [3]
+#        - StaggerU: [0]
+#        - ScheduleIterAlg: [0]
+#        - PrefetchLocalRead: [1]
+#        - PrefetchGlobalRead: [1]
+#        - StoreRemapVectorWidth: [0]
+#        - GlobalSplitU: [1]
+#        - GlobalSplitUAlgorithm: [MultipleBuffer]
+#        - GlobalReadVectorWidthA: [-1]
+#        - GlobalReadVectorWidthB: [-1]
+#        - VectorWidthA: [1]
+#        - VectorWidthB: [1]
+#        - LocalReadVectorWidth: [-1]
+#        - 1LDSBuffer: [0]
+#        - SourceSwap: [false]
+#        - DirectToVgprSparseMetadata: [false]
+#        - WorkGroupMapping: [1]
+#        - StoreVectorWidth: [-1]
+#        - DirectToVgprA: [False]
+#        - DirectToVgprB: [False]
+#        - WavefrontSize: [32]
+#        - ClusterDim: [[4, 4]]
+#        - ClusterMaskReduce: [False, True]
+#        - MulticastEarlyTimeout: [False, True]
+#      BenchmarkForkParameters:
+#      JoinParameters:
+#      BenchmarkJoinParameters:
+#      BenchmarkFinalParameters:
+#        - ProblemSizes:
+#          # MT64x64: 1x1 real -> 4x4 padded (#pad=15) single-wave, extreme + K scaling
+#          - Exact: [64, 64, 1, 8192]    # 1x1 real, #pad=15, 32 iters, 1 wave/WG  <-- Q3 probe
+#          - Exact: [256, 256, 1, 8192]  # 4x4=16 real, #pad=0, single-wave baseline (RED==NORED)
+#          # MT128x128: 1x1 real -> 4x4 padded single-wave
+#          - Exact: [128, 128, 1, 8192]  # 1x1 real, #pad=15, 32 iters, 1 wave/WG
+#          - Exact: [512, 512, 1, 8192]  # 4x4=16 real, #pad=0, single-wave baseline
+#
+#          - Exact: [160, 320, 1, 4096]  # 1x1 real -> 4x4 padded, #pad=15, 32 iters  <-- key probe (4-wave WG)
+#          - Exact: [320, 320, 1, 4096]  # 1x1 real -> 4x4 padded, #pad=15, 16 iters  (K-scaling check)
+#          - Exact: [640, 640, 1, 4096]  # 1x1 real -> 4x4 padded, #pad=15, 32 iters  <-- key probe (4-wave WG)
+#          - Exact: [1280, 1280, 1, 4096]  # 1x1 real -> 4x4 padded, #pad=15, 16 iters  (K-scaling check)
