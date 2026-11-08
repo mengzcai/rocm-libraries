@@ -1399,6 +1399,7 @@
     'ExpandPointerSwap',
     'ExtraLatencyForLR',
     'ExtraMiLatencyLeft',
+    'FastPrologueDivide',
     'ForceDisableShadowInit',
     'GlobalReadPerMfma',
     'GlobalReadVectorWidthA',
@@ -1858,6 +1859,14 @@
         1,
       ]),
       'len': 8,
+      'type': 'list',
+    }),
+    'FastPrologueDivide': dict({
+      'head': list([
+        0,
+        1,
+      ]),
+      'len': 2,
       'type': 'list',
     }),
     'ForceDisableShadowInit': dict({

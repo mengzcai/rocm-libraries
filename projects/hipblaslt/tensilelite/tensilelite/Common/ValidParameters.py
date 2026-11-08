@@ -1353,7 +1353,12 @@ validParameters = { # we need to make sure this matches develop
     # 1: Use iterate-mode for A
     # 2: Use iterate-mode for B
     # 3: Use iterate-mode for both A and B
-    "TDMIterateMode": [-1, 0, 1, 2, 3]
+    "TDMIterateMode": [-1, 0, 1, 2, 3],
+    # Prologue integer divisions (WorkGroupMapping and WGMXCC remap).
+    # 0: f64-reciprocal division (develop codegen)
+    # 1: exact 32-bit v_rcp_iflag_f32 division (LLVM udiv32 expansion); the two
+    #    divisions that share a divisor run as one lane-paired VALU chain.
+    "FastPrologueDivide": [0, 1]
 }
 
 

@@ -243,6 +243,11 @@ def _getName(state, requiredParameters: frozenset, splitGSU: bool, ignoreInterna
     # its name hash, so drop it where it cannot be set.
     if not isMxf4SubtilePath(state):
       requiredParametersTemp.discard("PostLoopStoreInNll")
+    # Opt-in prologue latency knob: keep every existing kernel name unchanged
+    # when it is off.
+    for _optIn in ("FastPrologueDivide",):
+      if not state.get(_optIn, 0):
+        requiredParametersTemp.discard(_optIn)
 
     if ignoreInternalArgs:
       # In split mode, GSU>1 and auto GSU use the distinct GSUM kernel name.

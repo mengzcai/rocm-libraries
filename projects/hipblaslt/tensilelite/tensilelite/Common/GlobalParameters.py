@@ -708,7 +708,8 @@ defaultBenchmarkCommonParameters = [
     # WorkGroupMapping orders clusters inside each half in bands of |WGM| clusters.
     {"ClusterAIDMapping": [-1]},
     {"HalfPLR": [0]},
-    {"TDMIterateMode": [0]}
+    {"TDMIterateMode": [0]},
+    {"FastPrologueDivide": [0]}
 ]
 
 # dictionary of defaults comprised of default option for each parameter

@@ -74,6 +74,18 @@ class TileProcessingStrategy(Component):
         module = Module('Persistent tileIndexToWorkGroup')
         module.addComment0('Map persistent tile index to wg0/1/2')
         module.add(SMulI32(dst=sgpr(sTmp + 1), src0=sgpr('NumWorkGroups0'), src1=sgpr('NumWorkGroups1'), comment='Total tiles'))
+        if kernel.get('FastPrologueDivide', 0) and not kernel['SpaceFillingAlgo']:
+            # FastPrologueDivide: both reciprocals in one chain (exact, same results).
+            from .WorkGroupMappingAlgos import scalarUInt32DivideChainedPair
+            tmpVgpr = writer.vgprPool.checkOut(4, 'div')
+            module.add(scalarUInt32DivideChainedPair(qA='WorkGroup2', dA=sTmp, divA=sTmp + 1, rA=sTmp + 2,
+                                                     qB='WorkGroup1', divB='NumWorkGroups0', rB='WorkGroup0',
+                                                     tmpVgprRes=ContinuousRegister(idx=tmpVgpr, size=4),
+                                                     wavewidth=kernel['WavefrontSize'],
+                                                     commentA='TileID // nWG0*nWG1', commentB='TileID // nWG0'))
+            writer.vgprPool.checkIn(tmpVgpr)
+            module.addSpaceLine()
+            return module
         tmpVgpr = writer.vgprPool.checkOut(2, 'div')
         tmpVgprRes = ContinuousRegister(idx=tmpVgpr, size=2)
         module.add(scalarUInt32DivideAndRemainder(qReg='WorkGroup2', dReg=sTmp, divReg=sTmp + 1, rReg=sTmp + 2, tmpVgprRes=tmpVgprRes, wavewidth=kernel['WavefrontSize'], doRemainder=True, comment='TileID // nWG0*nWG1'))
