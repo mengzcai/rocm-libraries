@@ -42,6 +42,7 @@ BenchmarkProblems:
         - GlobalReadVectorWidthA: [8]
         - GlobalReadVectorWidthB: [8]
         - WorkGroupMappingXCC: [-1, 1, 2]
+        - FastPrologueDivide: [0, 1]
       BenchmarkFinalParameters:
         - ProblemSizes:
           # === EXACT SIZES ===

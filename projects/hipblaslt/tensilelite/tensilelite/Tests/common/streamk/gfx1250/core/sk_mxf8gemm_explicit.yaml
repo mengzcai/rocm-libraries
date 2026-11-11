@@ -94,7 +94,8 @@ BenchmarkProblems:
         - DirectToVgprA: [False]
         - DirectToVgprB: [False]
         - WavefrontSize: [32]
-        - WorkGroupMapping: [1]
+        - FastPrologueDivide: [0, 1]
+        - WorkGroupMapping: [1, -4]
         # --- the parameters under test ---
         - TDMInst: [3]
         - MXLoadInst: ["TDM"]

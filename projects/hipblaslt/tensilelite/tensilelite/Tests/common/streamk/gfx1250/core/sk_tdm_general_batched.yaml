@@ -72,7 +72,8 @@ BenchmarkProblems:
         - DirectToVgprB: [False]
         - DirectToVgprSparseMetadata: [False]
         - WavefrontSize: [32]
-        - WorkGroupMapping: [1]
+        - FastPrologueDivide: [0, 1]
+        - WorkGroupMapping: [1, -4]
         - ExpandPointerSwap: [False]
       BenchmarkForkParameters:
       JoinParameters:

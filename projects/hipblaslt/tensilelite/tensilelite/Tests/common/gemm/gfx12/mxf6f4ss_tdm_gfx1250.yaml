@@ -144,6 +144,8 @@ BenchmarkProblems:
         - SourceSwap: [true]
         - WavefrontSize: [32]
         - TDMInst: [3]
+        - FastPrologueDivide: [0, 1]
+        - WorkGroupMapping: [1, -4]
       BenchmarkForkParameters:
       JoinParameters:
       BenchmarkJoinParameters:

@@ -1366,7 +1366,12 @@ validParameters = { # we need to make sure this matches develop
     # 1: Use iterate-mode for A
     # 2: Use iterate-mode for B
     # 3: Use iterate-mode for both A and B
-    "TDMIterateMode": [-1, 0, 1, 2, 3]
+    "TDMIterateMode": [-1, 0, 1, 2, 3],
+    # Integer divisions in the WorkGroupMapping / WGMXCC / ClusterAIDMapping prologue.
+    # 0: f64-reciprocal division (scalarUInt24DivideAndRemainder, exact below 2^24)
+    # 1: exact 32-bit division (scalarUInt32DivideAndRemainder, as Stream-K uses); gfx1250 only,
+    #    other ISAs are normalized to 0 and keep the default kernel name
+    "FastPrologueDivide": [0, 1]
 }
 
 

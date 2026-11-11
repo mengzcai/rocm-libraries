@@ -330,6 +330,13 @@ def _getName(state, requiredParameters: frozenset, splitGSU: bool, ignoreInterna
     if not state.get("PrefetchGL2SAddr", False):
       requiredParametersTemp.discard("PrefetchGL2SAddr")
 
+    # FastPrologueDivide=1 is the default; naming it would rename every kernel. It only exists on
+    # gfx1250 (other ISAs are normalized to 0 = develop's divide), so it never names other-arch kernels.
+    if state.get("FastPrologueDivide", 1) != 1 and tuple(state.get("ISA", ())) == (12, 5, 0):
+      requiredParametersTemp.add("FastPrologueDivide")
+    else:
+      requiredParametersTemp.discard("FastPrologueDivide")
+
     for key in sorted(requiredParametersTemp):
       if key not in state or key == "CustomKernel":
         continue

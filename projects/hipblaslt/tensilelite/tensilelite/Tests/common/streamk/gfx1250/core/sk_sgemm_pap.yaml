@@ -157,6 +157,7 @@ BenchmarkProblems:
         - VectorWidthA: [1]
         - VectorWidthB: [1]
         - WorkGroupMapping: [1, 8]
+        - FastPrologueDivide: [0, 1]
         - DirectToVgprA: [False]
         - DirectToVgprB: [False]
         - StaggerU: [0]
