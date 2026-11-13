@@ -80,6 +80,7 @@ BenchmarkProblems:
         - DepthU: [64]
         - WavefrontSize: [32]
         - TileProcessingStrategy: ["None", "DataParallel", "StreamK"]  # TEST all strategies
+        - FastPrologueDivide: [0, 1]
       BenchmarkFinalParameters:
         - ProblemSizes:
           - Exact: [64, 64, 1, 64]

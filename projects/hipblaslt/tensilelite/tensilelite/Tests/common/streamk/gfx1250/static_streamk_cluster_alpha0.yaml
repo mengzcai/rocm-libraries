@@ -44,6 +44,7 @@ BenchmarkProblems:
       - [2, 1]
       - [2, 2]
     - StreamKFixupTreeReduction: [0, 1]
+    - FastPrologueDivide: [0, 1]
     BenchmarkFinalParameters:
     - ProblemSizes:
       - Exact: [33, 65, 2, 8192]

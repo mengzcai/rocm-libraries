@@ -74,6 +74,21 @@ class TileProcessingStrategy(Component):
         module = Module('Persistent tileIndexToWorkGroup')
         module.addComment0('Map persistent tile index to wg0/1/2')
         module.add(SMulI32(dst=sgpr(sTmp + 1), src0=sgpr('NumWorkGroups0'), src1=sgpr('NumWorkGroups1'), comment='Total tiles'))
+        from .WorkGroupMappingAlgos import fastPrologueDivide, saluUInt32Reciprocals, saluUInt32DivTail
+        if fastPrologueDivide(kernel):
+            # Both reciprocals in one VALU chain (lanes 0/1), refinement and tails on the SALU.
+            # Each reciprocal lives in the quotient register of its division; WorkGroup0 (the last
+            # output) and then the dead total-tiles sgpr are scratch.
+            tmpVgpr = writer.vgprPool.checkOut(2, 'div')
+            module.add(saluUInt32Reciprocals([sTmp + 1, 'NumWorkGroups0'], ['WorkGroup2', 'WorkGroup1'], 'WorkGroup0',
+                                             ContinuousRegister(idx=tmpVgpr, size=2), comment='2^32 / [nWG0*nWG1, nWG0]'))
+            writer.vgprPool.checkIn(tmpVgpr)
+            module.add(saluUInt32DivTail('WorkGroup2', sTmp, sTmp + 1, 'WorkGroup2', sTmp + 2, 'WorkGroup0', comment='TileID // nWG0*nWG1'))
+            if kernel['SpaceFillingAlgo']:
+                module.add(SMovB32(dst=sgpr('PersistentTileID'), src=sgpr(sTmp + 2), comment=''))
+            module.add(saluUInt32DivTail('WorkGroup1', sTmp + 2, 'NumWorkGroups0', 'WorkGroup1', 'WorkGroup0', sTmp + 1, comment='TileID // nWG0'))
+            module.addSpaceLine()
+            return module
         tmpVgpr = writer.vgprPool.checkOut(2, 'div')
         tmpVgprRes = ContinuousRegister(idx=tmpVgpr, size=2)
         module.add(scalarUInt32DivideAndRemainder(qReg='WorkGroup2', dReg=sTmp, divReg=sTmp + 1, rReg=sTmp + 2, tmpVgprRes=tmpVgprRes, wavewidth=kernel['WavefrontSize'], doRemainder=True, comment='TileID // nWG0*nWG1'))

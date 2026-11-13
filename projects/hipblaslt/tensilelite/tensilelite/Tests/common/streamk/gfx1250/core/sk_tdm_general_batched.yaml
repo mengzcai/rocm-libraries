@@ -51,6 +51,7 @@ BenchmarkProblems:
         - MatrixInstruction:
           - [16, 16, 32, 1, 1, 1, 1, 2, 2]
         - DepthU: [256]
+        - FastPrologueDivide: [0, 1]
         - TDMInst: [3]
         - TileProcessingStrategy: [StreamK]
         - WorkAssignment: [StaticGrid, DynamicWorkQueue, Hybrid]

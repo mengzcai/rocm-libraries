@@ -50,6 +50,7 @@ BenchmarkProblems:
         - MatrixInstruction:
           - [16, 16, 32, 1, 1, 1, 1, 1, 1]
         - DepthU: [256]
+        - FastPrologueDivide: [0, 1]
         - TDMInst: [3]
         - TileProcessingStrategy: ["None"]
         - TDMIterateMode: [0]

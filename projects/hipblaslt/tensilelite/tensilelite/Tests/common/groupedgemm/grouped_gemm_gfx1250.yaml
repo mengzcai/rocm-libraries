@@ -42,6 +42,7 @@ BenchmarkProblems:
         - MatrixInstruction:
           - [16, 16, 32, 1, 1, 1, 1, 1, 1]
         - DepthU: [64]
+        - FastPrologueDivide: [0, 1]
         - WavefrontSize: [32]
         - GlobalReadVectorWidthA: [8]
         - GlobalReadVectorWidthB: [8]

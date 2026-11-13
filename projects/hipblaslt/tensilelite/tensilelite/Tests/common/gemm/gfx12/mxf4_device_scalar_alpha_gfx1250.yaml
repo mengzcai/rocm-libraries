@@ -85,6 +85,7 @@ BenchmarkProblems:
         - SourceSwap: [true]
         - WavefrontSize: [32]
         - GlobalSplitU: [1, 2]
+        - FastPrologueDivide: [0, 1]
         - GlobalSplitUAlgorithm: ["MultipleBuffer", "MultipleBufferSingleKernel"]
         # Keep MBSK from falling back to MultipleBuffer at runtime.
         - AdaptiveGemmGSUA: [0]

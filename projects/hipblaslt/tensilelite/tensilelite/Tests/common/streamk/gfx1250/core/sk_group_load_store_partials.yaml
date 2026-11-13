@@ -53,6 +53,7 @@ BenchmarkProblems:
     - InitCIterWmma: [0]
     - SwInstructionPrefetch: [0]
     - ClusterAIDMapping: [-2]
+    - FastPrologueDivide: [0, 1]
     - HalfPLR: [1]
     - WavefrontSize: [32]
     - ScheduleIterAlg: [4]

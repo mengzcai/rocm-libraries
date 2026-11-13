@@ -44,6 +44,8 @@ BenchmarkProblems:
         - DepthU: [64]
         - WavefrontSize: [32]
         - ClusterDim: [[1, 2]]  # Missing cluster dimension
+        - ClusterAIDMapping: [-1, -2]
+        - FastPrologueDivide: [0, 1]
         - ScheduleIterAlg: [4]
       BenchmarkFinalParameters:
         - ProblemSizes:

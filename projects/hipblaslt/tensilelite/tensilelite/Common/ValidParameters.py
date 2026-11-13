@@ -1400,7 +1400,16 @@ validParameters = { # we need to make sure this matches develop
     # 1: Use iterate-mode for A
     # 2: Use iterate-mode for B
     # 3: Use iterate-mode for both A and B
-    "TDMIterateMode": [-1, 0, 1, 2, 3]
+    "TDMIterateMode": [-1, 0, 1, 2, 3],
+    # Integer divisions by runtime values in the kernel prologue: WorkGroupMapping, WGMXCC (incl. the
+    # persistent WGMXCC=-1 chunked / K-Coherent / contiguous-group remaps), ClusterAIDMapping and the
+    # persistent tile-index decode (DataParallel / StreamK, also with clusters).
+    # 0: previous codegen (f64-reciprocal scalarUInt24DivideAndRemainder for the remaps, exact below 2^24;
+    #    rocisa scalarUInt32DivideAndRemainder for the tile-index decode)
+    # 1: exact 32-bit division where only the f32 reciprocal estimate runs on the VALU; the Newton step,
+    #    quotient and both corrections run on the SALU, and divisions sharing a divisor share one reciprocal.
+    #    gfx1250 only; other ISAs are normalized to 0 and keep their kernel names.
+    "FastPrologueDivide": [0, 1]
 }
 
 

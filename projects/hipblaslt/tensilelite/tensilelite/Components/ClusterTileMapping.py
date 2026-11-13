@@ -47,8 +47,17 @@ class ClusterTileMapping:
             module.add(SMulI32(dst=sgpr(sBlocksMN), src0=sgpr(sBlocksMN), src1=sgpr(sBlocksM), comment="blocks per batch"))
             tmpVgpr = writer.vgprPool.checkOut(2, 'div')
             tmpVgprRes = ContinuousRegister(idx=tmpVgpr, size=2)
-            module.add(scalarUInt32DivideAndRemainder(qReg='WorkGroup2', dReg=sTmp, divReg=sBlocksMN, rReg=sRem, tmpVgprRes=tmpVgprRes, wavewidth=kernel['WavefrontSize'], doRemainder=True, comment='block // blocksM*blocksN'))
-            module.add(scalarUInt32DivideAndRemainder(qReg='WorkGroup1', dReg=sRem, divReg=sBlocksM, rReg='WorkGroup0', tmpVgprRes=tmpVgprRes, wavewidth=kernel['WavefrontSize'], doRemainder=True, comment='block // blocksM'))
+            from .WorkGroupMappingAlgos import fastPrologueDivide, saluUInt32Reciprocals, saluUInt32DivTail
+            if fastPrologueDivide(kernel):
+                # Both reciprocals in one VALU chain, the rest on the SALU. Each reciprocal lives in the
+                # quotient register of its division; WorkGroup0 and then the dead sBlocksMN are scratch.
+                module.add(saluUInt32Reciprocals([sBlocksMN, sBlocksM], ['WorkGroup2', 'WorkGroup1'], 'WorkGroup0', tmpVgprRes,
+                                                 comment='2^32 / [blocksM*blocksN, blocksM]'))
+                module.add(saluUInt32DivTail('WorkGroup2', sTmp, sBlocksMN, 'WorkGroup2', sRem, 'WorkGroup0', comment='block // blocksM*blocksN'))
+                module.add(saluUInt32DivTail('WorkGroup1', sRem, sBlocksM, 'WorkGroup1', 'WorkGroup0', sBlocksMN, comment='block // blocksM'))
+            else:
+                module.add(scalarUInt32DivideAndRemainder(qReg='WorkGroup2', dReg=sTmp, divReg=sBlocksMN, rReg=sRem, tmpVgprRes=tmpVgprRes, wavewidth=kernel['WavefrontSize'], doRemainder=True, comment='block // blocksM*blocksN'))
+                module.add(scalarUInt32DivideAndRemainder(qReg='WorkGroup1', dReg=sRem, divReg=sBlocksM, rReg='WorkGroup0', tmpVgprRes=tmpVgprRes, wavewidth=kernel['WavefrontSize'], doRemainder=True, comment='block // blocksM'))
             tmpVgprRes = None
             writer.vgprPool.checkIn(tmpVgpr)
             module.add(SLShiftLeftB32(dst=sgpr("WorkGroup0"), shiftHex=hex(log2(cs)), src=sgpr("WorkGroup0"), comment="blockM * Cs"))

@@ -33,7 +33,8 @@ from rocisa.instruction import SAbsI32, SAddCU32, SAddI32, SAddU32, SAndB32, SBa
     SMaxU32, SMinU32, SMovB32, SMovB64, SMulI32, SNop, SOrB32, SSExtI16toI32, SSleep, SStoreB32, SSubU32, SXorB32, \
     SWaitCnt, VAddF32, VAddF64, VAddPKF16, VAddU32, VLShiftRightB32, VMovB32, VMovB64, VMulF32, VMulF64, \
     VReadfirstlaneB32, VReadlaneB32, VWritelaneB32, VCvtBF16toFP32, VCvtU32toF32, VCvtU32toF64, VRcpIFlagF32, \
-    VRcpF64, VCvtF32toU32, VCvtF64toU32, VMulU32U24, VMulLOU32, VSubU32, VCmpXGeU32, VCmpXGtU32, VCmpXEqU32
+    VRcpF64, VCvtF32toU32, VCvtF64toU32, VMulU32U24, VMulLOU32, VSubU32, VCmpXGeU32, VCmpXGtU32, VCmpXEqU32, \
+    SMulHIU32
 from rocisa.functions import scalarStaticDivideAndRemainder, sMagicDiv2, \
     vectorStaticMultiply, BranchIfNotZero, scalarUInt24DivideAndRemainder, \
     vectorUInt32CeilDivideAndRemainder
@@ -89,6 +90,67 @@ def scalarUInt24DivideAndRemainderPair(qReg, dReg, divReg, rReg, tmpVgprRes, wav
         module.add(VReadlaneB32(dst=sgpr(rReg[1]), src0=vgpr(tmpVgpr1), src1=1, comment=""))
 
     module.addComment0("End of pair-wise integer division. [s%s / s%s, s%s / s%s]"%(str(dReg[0]), str(divReg[0]), str(dReg[1]), str(divReg[1])))
+    return module
+
+def fastPrologueDivide(kernel):
+    """True if the prologue divisions use the FastPrologueDivide=1 sequence (gfx1250 only).
+
+    Other ISAs are normalized to FastPrologueDivide=0 during derivation; the ISA check also
+    covers kernel dicts that skip derivation (unit tests).
+    """
+    return kernel.get("FastPrologueDivide", 1) == 1 and tuple(kernel.get("ISA", ())) == (12, 5, 0)
+
+def saluUInt32Reciprocals(divRegs, recRegs, sTmp, tmpVgprRes, comment=""):
+    """recRegs[i] = refined 2^32 / divRegs[i], the scaled reciprocal of the udiv32 expansion.
+
+    Only the f32 reciprocal estimate runs on the VALU (one chain, divisor i in lane i);
+    the Newton step runs on the SALU. Together with saluUInt32DivTail this is the integer
+    arithmetic of rocisa's scalarUInt32DivideAndRemainder (LLVM AMDGPU udiv32), so the
+    results are exact for every 32-bit dividend and nonzero divisor.
+    recRegs must not alias divRegs or sTmp; tmpVgprRes needs 2 VGPRs.
+    """
+    assert len(divRegs) == len(recRegs) and 1 <= len(divRegs) <= 4 and tmpVgprRes.size >= 2
+    module = Module("saluUInt32Reciprocals")
+    tD, tS = vgpr(tmpVgprRes.idx), vgpr(tmpVgprRes.idx + 1)
+    if len(divRegs) == 1:
+        module.add(VCvtU32toF32(dst=tD, src=sgpr(divRegs[0]), comment=comment))
+    else:
+        module.add(VMovB32(dst=tD, src=sgpr(divRegs[0]), comment="lane0 divisor"))
+        for lane in range(1, len(divRegs)):
+            module.add(VWritelaneB32(dst=tD, src0=sgpr(divRegs[lane]), src1=lane, comment="lane%u divisor" % lane))
+        module.add(VCvtU32toF32(dst=tD, src=tD, comment=comment))
+    module.add(VRcpIFlagF32(dst=tD, src=tD, comment=comment))
+    # The scale move sits between v_rcp_iflag_f32 and its consumer (one wait state, as in rocisa).
+    module.add(VMovB32(dst=tS, src="0x4f7ffffe", comment="2^32 - 512"))
+    module.add(VMulF32(dst=tD, src0=tS, src1=tD, comment="2^32 / divisor"))
+    module.add(VCvtF32toU32(dst=tD, src=tD, comment=comment))
+    module.add(VReadfirstlaneB32(dst=sgpr(recRegs[0]), src=tD, comment="reciprocal estimate (lane0)"))
+    for lane in range(1, len(recRegs)):
+        module.add(VReadlaneB32(dst=sgpr(recRegs[lane]), src0=tD, src1=lane, comment="reciprocal estimate (lane%u)" % lane))
+    for d, r in zip(divRegs, recRegs):  # one Newton step: r += mulhi(r, -(r*d))
+        module.add(SMulI32(dst=sgpr(sTmp), src0=sgpr(r), src1=sgpr(d), comment="refine 2^32 / divisor"))
+        module.add(SSubU32(dst=sgpr(sTmp), src0=0, src1=sgpr(sTmp), comment="refine 2^32 / divisor"))
+        module.add(SMulHIU32(dst=sgpr(sTmp), src0=sgpr(r), src1=sgpr(sTmp), comment="refine 2^32 / divisor"))
+        module.add(SAddU32(dst=sgpr(r), src0=sgpr(r), src1=sgpr(sTmp), comment="refine 2^32 / divisor"))
+    return module
+
+def saluUInt32DivTail(qReg, dReg, divReg, recReg, remReg, sTmp, comment=""):
+    """qReg = dReg / divReg, remReg = dReg % divReg from recReg (saluUInt32Reciprocals); SALU only.
+
+    Clobbers SCC and sTmp. qReg may alias recReg (recReg is read only by the first
+    instruction); otherwise qReg, remReg and sTmp must be distinct from each other and
+    from dReg, divReg and recReg.
+    """
+    module = Module("saluUInt32DivTail")
+    c = comment if comment else "s%s = s%s / s%s" % (str(qReg), str(dReg), str(divReg))
+    module.add(SMulHIU32(dst=sgpr(qReg), src0=sgpr(dReg), src1=sgpr(recReg), comment=c))
+    module.add(SMulI32(dst=sgpr(sTmp), src0=sgpr(qReg), src1=sgpr(divReg), comment=c))
+    module.add(SSubU32(dst=sgpr(remReg), src0=sgpr(dReg), src1=sgpr(sTmp), comment=c))
+    for _ in range(2):
+        module.add(SSubU32(dst=sgpr(sTmp), src0=sgpr(remReg), src1=sgpr(divReg), comment="remainder - divisor"))
+        module.add(SCmpGeU32(src0=sgpr(remReg), src1=sgpr(divReg), comment="remainder >= divisor?"))
+        module.add(SCSelectB32(dst=sgpr(remReg), src0=sgpr(sTmp), src1=sgpr(remReg), comment="remainder"))
+        module.add(SAddCU32(dst=sgpr(qReg), src0=sgpr(qReg), src1=0, comment="quotient += (remainder >= divisor)"))
     return module
 
 def wgmXCC(writer, kernel, tmpSgprNumWorkGroups):
@@ -168,18 +230,28 @@ def wgmXCC(writer, kernel, tmpSgprNumWorkGroups):
             sgprMNval  = tmpSgprKC.idx + 2
             sgprKMN    = tmpSgprKC.idx + 3
 
-            tmpVgpr    = writer.vgprPool.checkOutAligned(6, 2)
-            tmpVgprRes = ContinuousRegister(tmpVgpr, 6)
+            if fastPrologueDivide(kernel):
+                tmpVgpr    = writer.vgprPool.checkOutAligned(2, 2)
+                tmpVgprRes = ContinuousRegister(tmpVgpr, 2)
+                # One reciprocal of K, kept in sgprMNval until the second quotient overwrites it.
+                # sgprKval, then the dead remainder sgprKMN (recomputed below), are scratch.
+                module.addComment0("divmod: [MN, mn] = [numWGs, WG0] / K, remainders [_, k] (one reciprocal of K)")
+                module.add(saluUInt32Reciprocals([SgprK], [sgprMNval], sgprKval, tmpVgprRes, comment="2^32 / K"))
+                module.add(saluUInt32DivTail(sgprMN, tmpSgprNumWorkGroups, SgprK, sgprMNval, sgprKMN, sgprKval, comment="MN = numWGs / K"))
+                module.add(saluUInt32DivTail(sgprMNval, "WorkGroup0", SgprK, sgprMNval, sgprKval, sgprKMN, comment="mn = WG0 / K, k = WG0 % K"))
+            else:
+                tmpVgpr    = writer.vgprPool.checkOutAligned(6, 2)
+                tmpVgprRes = ContinuousRegister(tmpVgpr, 6)
 
-            module.addComment0("Pair divmod: [MN, mn] = [numWGs, WG0] / [K, K], remainders [_, k]")
-            module.add(scalarUInt24DivideAndRemainderPair(
-                qReg=[sgprMN, sgprMNval],
-                dReg=[tmpSgprNumWorkGroups, "WorkGroup0"],
-                divReg=[SgprK, SgprK],
-                rReg=[sgprKMN, sgprKval],
-                tmpVgprRes=tmpVgprRes,
-                wavewidth=kernel["WavefrontSize"],
-                doRemainder=True))
+                module.addComment0("Pair divmod: [MN, mn] = [numWGs, WG0] / [K, K], remainders [_, k]")
+                module.add(scalarUInt24DivideAndRemainderPair(
+                    qReg=[sgprMN, sgprMNval],
+                    dReg=[tmpSgprNumWorkGroups, "WorkGroup0"],
+                    divReg=[SgprK, SgprK],
+                    rReg=[sgprKMN, sgprKval],
+                    tmpVgprRes=tmpVgprRes,
+                    wavewidth=kernel["WavefrontSize"],
+                    doRemainder=True))
             writer.vgprPool.checkIn(tmpVgpr)
 
             module.addComment0("K_MN = K * MN; skip conversion for tail WGs")
@@ -219,10 +291,19 @@ def wgmXCC(writer, kernel, tmpSgprNumWorkGroups):
             tmpVgpr     = writer.vgprPool.checkOutAligned(4,2, tag="wgmXCC_tmpVgpr")
             tmpVgprRes  = ContinuousRegister(tmpVgpr, 4)
 
-            module.addComment0("divmod(old_wg, WGMXCC)")
-            module.add(scalarUInt24DivideAndRemainder(qReg=SgprX, rReg=SgprG, dReg="WorkGroup0", divReg=SgprWGMXCC, tmpVgprRes=tmpVgprRes, wavewidth=kernel["WavefrontSize"], doRemainder=True))
-            module.addComment0("divmod(numWGs, WGMXCC) -- preloaded tmpSgprNumWorkGroups (== skGrid)")
-            module.add(scalarUInt24DivideAndRemainder(qReg=SgprQ, rReg=SgprR, dReg=tmpSgprNumWorkGroups, divReg=SgprWGMXCC, tmpVgprRes=tmpVgprRes, wavewidth=kernel["WavefrontSize"], doRemainder=True))
+            if fastPrologueDivide(kernel):
+                # tmpSgprRes.idx is free here: it holds the reciprocal of WGMXCC; SgprO is scratch until set below.
+                sRec = tmpSgprRes.idx
+                module.add(saluUInt32Reciprocals([SgprWGMXCC], [sRec], SgprO, tmpVgprRes, comment="2^32 / WGMXCC"))
+                module.addComment0("divmod(old_wg, WGMXCC)")
+                module.add(saluUInt32DivTail(SgprX, "WorkGroup0", SgprWGMXCC, sRec, SgprG, SgprO))
+                module.addComment0("divmod(numWGs, WGMXCC) -- preloaded tmpSgprNumWorkGroups (== skGrid)")
+                module.add(saluUInt32DivTail(SgprQ, tmpSgprNumWorkGroups, SgprWGMXCC, sRec, SgprR, SgprO))
+            else:
+                module.addComment0("divmod(old_wg, WGMXCC)")
+                module.add(scalarUInt24DivideAndRemainder(qReg=SgprX, rReg=SgprG, dReg="WorkGroup0", divReg=SgprWGMXCC, tmpVgprRes=tmpVgprRes, wavewidth=kernel["WavefrontSize"], doRemainder=True))
+                module.addComment0("divmod(numWGs, WGMXCC) -- preloaded tmpSgprNumWorkGroups (== skGrid)")
+                module.add(scalarUInt24DivideAndRemainder(qReg=SgprQ, rReg=SgprR, dReg=tmpSgprNumWorkGroups, divReg=SgprWGMXCC, tmpVgprRes=tmpVgprRes, wavewidth=kernel["WavefrontSize"], doRemainder=True))
             writer.vgprPool.checkIn(tmpVgpr)
             module.add(SCmpLtU32(src0=sgpr(SgprG), src1=sgpr(SgprR)))
             module.add(SCSelectB32(dst=sgpr(tmpSgpr), src0=hex(1), src1=hex(0), comment="Select multiplier"))
@@ -276,16 +357,28 @@ def wgmXCC(writer, kernel, tmpSgprNumWorkGroups):
 
             # CU_count > 0
             module.add(label_XCCG_nonzero)
+            fast = fastPrologueDivide(kernel)
+            if fast:
+                # tmpSgpr is free in this path: it holds the reciprocal of CU_Count, shared by both divisions.
+                module.add(saluUInt32Reciprocals([CU_CountSgpr], [tmpSgpr], tmpSgpr2, tmpVgprRes, comment="2^32 / CU_Count"))
             module.addComment0("temp0 = (wg//CU_Count)*CU_Count")
-            module.add(scalarUInt24DivideAndRemainder(qReg=tmpSgpr0, dReg="WorkGroup0", divReg=CU_CountSgpr, rReg=tmpSgpr1, tmpVgprRes=tmpVgprRes, wavewidth=kernel["WavefrontSize"], doRemainder=True))
+            if fast:
+                module.add(saluUInt32DivTail(tmpSgpr0, "WorkGroup0", CU_CountSgpr, tmpSgpr, tmpSgpr1, tmpSgpr2))
+            else:
+                module.add(scalarUInt24DivideAndRemainder(qReg=tmpSgpr0, dReg="WorkGroup0", divReg=CU_CountSgpr, rReg=tmpSgpr1, tmpVgprRes=tmpVgprRes, wavewidth=kernel["WavefrontSize"], doRemainder=True))
             module.add(SMulI32(dst=sgpr(tmpSgpr0), src0=sgpr(tmpSgpr0), src1=sgpr(CU_CountSgpr)))
             module.addComment0("temp1 = (wg%CU_Count)//WGMXCC")
             module.add(SLShiftRightB32(dst=sgpr(tmpSgpr1), shiftHex=sgpr(WGMXCCSgpr), src=sgpr(tmpSgpr1)))
             module.addComment0("temp0 = temp0 + temp1")
             module.add(SAddU32(dst=sgpr(tmpSgpr0), src0=sgpr(tmpSgpr0), src1=sgpr(tmpSgpr1)))
             module.addComment0("temp1 = (wg%WGMXCC) * ((WGs - (WGs//CU_Count) * CU_Count) if (wg > (WGs//CU_Count) * CU_Count) else CU_Count)//WGMXCC")
-            module.add(scalarUInt24DivideAndRemainder(qReg=tmpSgpr1, dReg=tmpSgprNumWorkGroups, divReg=CU_CountSgpr, rReg=-1, tmpVgprRes=tmpVgprRes, wavewidth=kernel["WavefrontSize"], doRemainder=False))
-            module.add(SMulI32(dst=sgpr(tmpSgpr1), src0=sgpr(tmpSgpr1), src1=sgpr(CU_CountSgpr)))
+            if fast:
+                # Last use of the reciprocal: the quotient overwrites it; tmpSgpr1 / tmpSgpr2 are dead here.
+                module.add(saluUInt32DivTail(tmpSgpr, tmpSgprNumWorkGroups, CU_CountSgpr, tmpSgpr, tmpSgpr1, tmpSgpr2))
+                module.add(SMulI32(dst=sgpr(tmpSgpr1), src0=sgpr(tmpSgpr), src1=sgpr(CU_CountSgpr)))
+            else:
+                module.add(scalarUInt24DivideAndRemainder(qReg=tmpSgpr1, dReg=tmpSgprNumWorkGroups, divReg=CU_CountSgpr, rReg=-1, tmpVgprRes=tmpVgprRes, wavewidth=kernel["WavefrontSize"], doRemainder=False))
+                module.add(SMulI32(dst=sgpr(tmpSgpr1), src0=sgpr(tmpSgpr1), src1=sgpr(CU_CountSgpr)))
             module.add(SSubU32(dst=sgpr(tmpSgpr2), src0=sgpr(tmpSgprNumWorkGroups), src1=sgpr(tmpSgpr1)))
             module.add(SCmpGtU32(src0=sgpr("WorkGroup0"), src1=sgpr(tmpSgpr1)))
             module.add(SCSelectB32(dst=sgpr(tmpSgpr1), src0=sgpr(tmpSgpr2), src1=sgpr(CU_CountSgpr)))
@@ -369,14 +462,24 @@ def DefaultWGM(writer, kernel, sgprWGM, wg0="WorkGroup0", wg1="WorkGroup1"):
                 module.add(SCmpGeI32(src0=sgpr(tmpWGM), src1=0, comment="WGM >= 0 ?"))
                 module.add(SCBranchSCC1(labelName=wgmLabel.getLabelName(), comment="branch if WGM >= 0"))
                 module.add(SAbsI32(dst=sgpr(wgmAbs), src=sgpr(tmpWGM), comment="abs(WGM)"))
-            # note this overwrites blockId2+1
-            module.add(scalarUInt24DivideAndRemainder(qReg=blockId2, dReg=workgroupSecond, divReg=wgmAbs, rReg=wgSerial2, tmpVgprRes=tmpVgprRes, wavewidth=kernel["WavefrontSize"], doRemainder=False))
+            fast = fastPrologueDivide(kernel)
+            if fast:
+                # One reciprocal of |WGM| (VALU estimate, SALU refinement) for blockId and numFullBlocks.
+                # It lives in wgmDivisor, which the second quotient then overwrites; wgSerial2 and
+                # wgmDivisor2 are scratch until they are set below.
+                module.add(saluUInt32Reciprocals([wgmAbs], [wgmDivisor], wgmDivisor2, tmpVgprRes, comment="2^32 / |WGM|"))
+                module.add(saluUInt32DivTail(blockId2, workgroupSecond, wgmAbs, wgmDivisor, wgSerial2, wgmDivisor2, comment="blockId = %s / |WGM|" % workgroupSecond))
+                module.add(saluUInt32DivTail(wgmDivisor, numWorkgroupsSecond, wgmAbs, wgmDivisor, wgSerial2, wgmDivisor2, comment="numFullBlocks = %s / |WGM|" % numWorkgroupsSecond))
+            else:
+                # note this overwrites blockId2+1
+                module.add(scalarUInt24DivideAndRemainder(qReg=blockId2, dReg=workgroupSecond, divReg=wgmAbs, rReg=wgSerial2, tmpVgprRes=tmpVgprRes, wavewidth=kernel["WavefrontSize"], doRemainder=False))
             module.add(SMulI32(dst=sgpr(wgSerial2), src0=sgpr(blockId2), src1=sgpr(wgmAbs), comment="quotient * non-magic divisor"))
             module.add(SSubU32(dst=sgpr(wgSerial2), src0=sgpr(workgroupSecond), src1=sgpr(wgSerial2), comment="%s=remainder"%workgroupSecond))
             module.add(SMulI32(dst=sgpr(wgSerial2), src0=sgpr(wgSerial2), src1=sgpr(numWorkgroupsFirst), comment="(wg1 %% WGM)*%s"%numWorkgroupsFirst))
             module.add(SAddU32(dst=sgpr(wgSerial2), src0=sgpr(wgSerial2), src1=sgpr(workgroupFirst), comment="wgSerial = wg0 + (wg1 %% WGM)*%s"%numWorkgroupsFirst))
 
-            module.add(scalarUInt24DivideAndRemainder(qReg=wgmDivisor, dReg=numWorkgroupsSecond, divReg=wgmAbs, rReg=wgSerial2, tmpVgprRes=tmpVgprRes, wavewidth=kernel["WavefrontSize"], doRemainder=False))
+            if not fast:
+                module.add(scalarUInt24DivideAndRemainder(qReg=wgmDivisor, dReg=numWorkgroupsSecond, divReg=wgmAbs, rReg=wgSerial2, tmpVgprRes=tmpVgprRes, wavewidth=kernel["WavefrontSize"], doRemainder=False))
             module.add(SMulI32(dst=sgpr(wgmDivisor2), src0=sgpr(wgmAbs), src1=sgpr(wgmDivisor), comment="quotient * non-magic divisor"))
             module.add(SSubU32(dst=sgpr(wgmDivisorMagicNumber), src0=sgpr(numWorkgroupsSecond), src1=sgpr(wgmDivisor2), comment="%s=remainder"%numWorkgroupsSecond))
             module.add(SCmpEQU32(src0=sgpr(wgmDivisorMagicNumber), src1=0, comment="remainder == 0 ?"))
@@ -388,9 +491,15 @@ def DefaultWGM(writer, kernel, sgprWGM, wg0="WorkGroup0", wg1="WorkGroup1"):
             # For WGM >= 1
             # WorkGroup0 = wgSerial2 / wgmDivisor
             # WorkGroup1 = wgSerial2 - (wgmDivisor * WorkGroup0)
-            module.add(scalarUInt24DivideAndRemainder(qReg=workgroupFirst, dReg=wgSerial2, divReg=wgmDivisor, rReg=workgroupSecond, tmpVgprRes=tmpVgprRes, wavewidth=kernel["WavefrontSize"], doRemainder=True))
-            module.add(SMulI32(dst=sgpr(workgroupSecond), src0=sgpr(workgroupFirst), src1=sgpr(wgmDivisor), comment="quotient * non-magic divisor"))
-            module.add(SSubU32(dst=sgpr(workgroupSecond), src0=sgpr(wgSerial2), src1=sgpr(workgroupSecond), comment="%s=remainder"%workgroupSecond))
+            if fast:
+                # workgroupFirst is already folded into wgSerial2, so it holds the reciprocal
+                # until the quotient overwrites it; the tail also yields the remainder.
+                module.add(saluUInt32Reciprocals([wgmDivisor], [workgroupFirst], wgmDivisor2, tmpVgprRes, comment="2^32 / wgmDivisor"))
+                module.add(saluUInt32DivTail(workgroupFirst, wgSerial2, wgmDivisor, workgroupFirst, workgroupSecond, wgmDivisor2, comment="%s = wgSerial / wgmDivisor, %s = remainder" % (workgroupFirst, workgroupSecond)))
+            else:
+                module.add(scalarUInt24DivideAndRemainder(qReg=workgroupFirst, dReg=wgSerial2, divReg=wgmDivisor, rReg=workgroupSecond, tmpVgprRes=tmpVgprRes, wavewidth=kernel["WavefrontSize"], doRemainder=True))
+                module.add(SMulI32(dst=sgpr(workgroupSecond), src0=sgpr(workgroupFirst), src1=sgpr(wgmDivisor), comment="quotient * non-magic divisor"))
+                module.add(SSubU32(dst=sgpr(workgroupSecond), src0=sgpr(wgSerial2), src1=sgpr(workgroupSecond), comment="%s=remainder"%workgroupSecond))
             module.add(SMulI32(dst=sgpr(blockId2), src0=sgpr(blockId2), src1=sgpr(wgmAbs), comment="blockId * WGM"))
             module.add(SAddU32(dst=sgpr(workgroupSecond), src0=sgpr(workgroupSecond), src1=sgpr(blockId2), comment="wg1 += blockId * WGM"))
             if wgmType:
@@ -452,7 +561,9 @@ def ClusterAIDRemap(writer, kernel, sgprWGM):
     #   sS = split direction (0 = split N, 1 = split M), sJ = index j inside the half,
     #   sQ = H = |WGM|, sR = divisor / band height h.
     # WGM is only known at runtime, so all 10 are always allocated.
-    with writer.allocTmpSgpr(10, tag="ClusterAIDRemap") as tmp:
+    # FastPrologueDivide=1 adds 2 for divide(): the reciprocal and a scratch.
+    fast = fastPrologueDivide(kernel)
+    with writer.allocTmpSgpr(12 if fast else 10, tag="ClusterAIDRemap") as tmp:
         sCx, sCy, sHalf, sL, sT, sP = range(tmp.idx, tmp.idx + 6)
         sS, sJ, sQ, sR = range(tmp.idx + 6, tmp.idx + 10)
 
@@ -513,9 +624,16 @@ def ClusterAIDRemap(writer, kernel, sgprWGM):
         tmpVgprRes = ContinuousRegister(idx=tmpVgpr, size=4)
 
         # divide(q, d, div, r): unsigned sgpr division, q = d // div, r = d % div.
-        # Uses the 4 tmp vgprs above and is exact only for 24-bit values (cluster counts are far
-        # below 2^24); it may clobber SCC, so do not reuse a compare across it.
+        # Uses the tmp vgprs above; it may clobber SCC, so do not reuse a compare across it.
+        # FastPrologueDivide=0 is exact only for 24-bit values (cluster counts are far below 2^24);
+        # FastPrologueDivide=1 is exact for all 32-bit values.
         def divide(q, d, div, r):
+            if fast:
+                sRec, sScratch = tmp.idx + 10, tmp.idx + 11
+                m = Module("ClusterAIDRemap_divide")
+                m.add(saluUInt32Reciprocals([div], [sRec], sScratch, tmpVgprRes, comment="2^32 / s%s" % str(div)))
+                m.add(saluUInt32DivTail(q, d, div, sRec, r, sScratch))
+                return m
             return scalarUInt24DivideAndRemainder(qReg=q, dReg=d, divReg=div, rReg=r, tmpVgprRes=tmpVgprRes,
                                                   wavewidth=kernel["WavefrontSize"], doRemainder=True)
 
@@ -634,9 +752,19 @@ def chiplet_transform_chunked(writer, kernel, sgprNumXCC, sgprIndex, sgprNumWG, 
 
     # Compute sgprTmp = numWG, sgprTmp2 = numXCC * chunk_size
     module.add(SMulI32(dst=sgpr(sgprTmp2), src0=sgpr(sgprNumXCC), src1=sgpr(sgprChunkSize), comment="Compute total number of tiles"))
-    # compute (numWG // (numXCC * chunkSize)) and localId = index // numXCC, note: sgprPosInChunk is not used
-    module.add(scalarUInt24DivideAndRemainderPair(qReg=[sgprLocalId,sgprTmp], dReg=[sgprIndex,sgprNumWG], \
-                                                  divReg=[sgprNumXCC,sgprTmp2], rReg=[sgprXCC, sgprPosInChunk], tmpVgprRes=tmpVgprRes, wavewidth=kernel["WavefrontSize"], doRemainder=True))
+    fast = fastPrologueDivide(kernel)
+    if fast:
+        # One VALU chain for the reciprocals of all three divisors (lanes 0..2), the rest on the SALU.
+        # Each reciprocal lives in the quotient register of its division (overwritten by the quotient);
+        # registers whose value is not yet (or no longer) needed are the scratch.
+        module.add(saluUInt32Reciprocals([sgprNumXCC, sgprTmp2, sgprChunkSize], [sgprLocalId, sgprTmp, sgprChunkId], sgprXCC, \
+                                         tmpVgprRes, comment="2^32 / [numXCC, numXCC*chunkSize, chunkSize]"))
+        module.add(saluUInt32DivTail(sgprTmp, sgprNumWG, sgprTmp2, sgprTmp, sgprPosInChunk, sgprXCC, comment="numWG // (numXCC * chunkSize)"))
+        module.add(saluUInt32DivTail(sgprLocalId, sgprIndex, sgprNumXCC, sgprLocalId, sgprXCC, sgprPosInChunk, comment="localId = index // numXCC, xcc = index % numXCC"))
+    else:
+        # compute (numWG // (numXCC * chunkSize)) and localId = index // numXCC, note: sgprPosInChunk is not used
+        module.add(scalarUInt24DivideAndRemainderPair(qReg=[sgprLocalId,sgprTmp], dReg=[sgprIndex,sgprNumWG], \
+                                                      divReg=[sgprNumXCC,sgprTmp2], rReg=[sgprXCC, sgprPosInChunk], tmpVgprRes=tmpVgprRes, wavewidth=kernel["WavefrontSize"], doRemainder=True))
     # (numWG // (numXCC * chunkSize)) * (numXCC * chunkSize)
     module.add(SMulI32(dst=sgpr(sgprTmp), src0=sgpr(sgprTmp), src1=sgpr(sgprTmp2), comment=""))
     # check,     if index > (num_workgroups // (num_xcds * chunk_size)) * (num_xcds * chunk_size)
@@ -645,7 +773,11 @@ def chiplet_transform_chunked(writer, kernel, sgprNumXCC, sgprIndex, sgprNumWG, 
 
     # Calculate: index = chunk_idx * num_xcds * chunk_size + xcd * chunk_size + pos_in_chunk
     # chunk ID, pos_in_chunk
-    module.add(scalarUInt24DivideAndRemainder(qReg=sgprChunkId, dReg=sgprLocalId, divReg=sgprChunkSize, rReg=sgprPosInChunk, tmpVgprRes=tmpVgprRes, wavewidth=kernel["WavefrontSize"], doRemainder=True))
+    if fast:
+        # sgprTmp is dead here (set again below).
+        module.add(saluUInt32DivTail(sgprChunkId, sgprLocalId, sgprChunkSize, sgprChunkId, sgprPosInChunk, sgprTmp, comment="chunkId = localId // chunkSize"))
+    else:
+        module.add(scalarUInt24DivideAndRemainder(qReg=sgprChunkId, dReg=sgprLocalId, divReg=sgprChunkSize, rReg=sgprPosInChunk, tmpVgprRes=tmpVgprRes, wavewidth=kernel["WavefrontSize"], doRemainder=True))
     # xcc * chunk_size
     module.add(SMulI32(dst=sgpr(sgprTmp), src0=sgpr(sgprXCC), src1=sgpr(sgprChunkSize), comment=""))
     # chunkId * numxcc * chunk_size

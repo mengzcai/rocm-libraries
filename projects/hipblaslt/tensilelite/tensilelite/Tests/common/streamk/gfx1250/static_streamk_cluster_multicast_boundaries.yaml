@@ -43,6 +43,7 @@ BenchmarkProblems:
     - BenchmarkCommonParameters: *dense_defaults
       ForkParameters:
         - ClusterDim: [[2, 1], [2, 2], [1, 4]]
+        - FastPrologueDivide: [0, 1]
       BenchmarkFinalParameters:
         - ProblemSizes: [{Exact: [96, 96, 1, 64]}, {Exact: [96, 96, 3, 0]},
             {Exact: [256, 256, 2, 8192]}, {Exact: [33, 65, 2, 8192]}]

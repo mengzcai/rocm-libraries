@@ -53,6 +53,7 @@ BenchmarkProblems:
       ForkParameters:
         - ClusterDim: [[4, 1], [2, 2], [1, 4]]
         - PrefetchGlobalRead: [1, 2]
+        - FastPrologueDivide: [0, 1]
       BenchmarkFinalParameters:
         - ProblemSizes:
           - Exact: [96, 96, 3, 0]

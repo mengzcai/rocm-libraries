@@ -2511,6 +2511,11 @@ class Solution(collections.abc.Mapping):
 
     isa = tuple(state["ISA"])
 
+    # FastPrologueDivide is gfx1250-only: other ISAs keep the previous prologue divide
+    # (and their kernel names, see Naming.py) whatever the YAML asks for.
+    if isa != (12, 5, 0):
+      state["FastPrologueDivide"] = 0
+
     if state["WavefrontSize"] == -1:
       state["WavefrontSize"] = 32 if isaInfoMap[isa].archCaps["HasWave32"] else 64
 
