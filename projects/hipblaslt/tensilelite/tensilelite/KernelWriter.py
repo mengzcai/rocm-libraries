@@ -418,6 +418,14 @@ class StateValues:
   numStoreSgprNames: List[str]           = field(init=False) # For post-loop kernel args
   numStoreSgprNameSizes: List[int]       = field(init=False) # For post-loop kernel args
   numStoreSgprToLoad: int                = 0 # For post-loop kernel args
+  # Pure-gemm flag computed in the prologue (whole-kernel sgpr PureGemmFlag): its terms,
+  # the transient sgprs {term: index} between issue and fold, and the kernarg offsets
+  # it was loaded from (endSummation checks it would load the same ones).
+  pureGemmEarlyTerms: list               = None
+  pureGemmEarlyNames: dict               = None
+  pureGemmEarlyArgOffsets: tuple         = None
+  pureGemmEarlyLayout: dict              = None
+  pureGemmEarlyDeferred: bool            = False # loads deferred to the end of ClusterAIDRemap
   numStoreSgprNames2: List[str]          = field(init=False) # For post-loop kernel args
   numStoreSgprNameSizes2: List[int]      = field(init=False) # For post-loop kernel args
   numStoreSgprToLoad2: int               = 0 # For post-loop kernel args
@@ -6018,10 +6026,19 @@ class KernelWriter(PersistentKernelState, StreamKKernelState, metaclass=abc.ABCM
         self.removeSgprVarFromPool("SrdD")
         self.removeSgprVarFromPool("SrdC")
         module.add(self.globalWriteWorkGroupInit(kernel))
+        if self.states.pureGemmEarlyTerms:
+          if self.pureGemmEarlyIssueAtStart(kernel):
+            # Pure-gemm flag: kernarg loads were issued at the start of the prologue.
+            module.add(self.pureGemmEarlyFlagCompute(kernel))
+          else:
+            # Persistent: per tile, the kernarg loads ride under the first global/TDM reads.
+            module.add(self.pureGemmEarlyFlagIssue(kernel))
         if self.states.doShadowInit == 2:
           module.add(self.initC(kernel, initCIterWmma)) # initC while waiting for global reads
           if kernel["ProblemType"]["Gradient"] and kernel["ProblemType"]["UseBias"] and (kernel["ProblemType"]["BiasSrc"] == "A" or kernel["ProblemType"]["BiasSrc"] == "B"):
             module.add(self.initSumUnroll(kernel))
+        if self.states.pureGemmEarlyTerms and not self.pureGemmEarlyIssueAtStart(kernel):
+          module.add(self.pureGemmEarlyFlagCompute(kernel))
         module.add(self.closeShadowInit(kernel))
 
       # Wait for PGR code in setupNewTile
@@ -11281,6 +11298,12 @@ class KernelWriter(PersistentKernelState, StreamKKernelState, metaclass=abc.ABCM
       storeSgprLoad += self.states.numActivationTypeArgSize + self.states.numactivationArgTotalSize
 
     self.states.numStoreSgprToLoad = storeSgprLoad
+
+    # Pure-gemm store pass (CompactLoopStore): the flag that selects it is computed in the
+    # prologue into one whole-kernel sgpr (PureGemmFlag, defined by pureGemmEarlyFlagIssue),
+    # so the epilogue only branches on it and the pure path never waits for the epilogue kernargs.
+    self.states.pureGemmEarlyTerms = self.pureGemmEarlyFlagTerms(kernel) \
+      if hasattr(self, "pureGemmEarlyFlagTerms") else None
     if self.db["InitLds"] : print ("\n***WARNING: InitLds enabled, may impact performance\n")
     if self.db["InitSgpr"] : print ("\n***WARNING: InitSgpr enabled, may impact performance\n")
     if self.db["InitVgpr"] : print ("\n***WARNING: InitVgpr enabled, may impact performance\n")

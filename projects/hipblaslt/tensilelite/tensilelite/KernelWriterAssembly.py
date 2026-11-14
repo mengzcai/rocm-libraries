@@ -4193,6 +4193,12 @@ class KernelWriterAssembly(KernelWriter):
     # define the rest of sgprs
     module.addModuleAsFlatItems(self.defineVariableSgprs(kernel))
 
+    # Pure-gemm flag kernargs: issue them now so the WGM/TDM setup hides their latency
+    # (after ClusterAIDRemap's kmcnt wait when there is one, see pureGemmEarlyIssueAtStart);
+    # the shadow init folds them.
+    if self.states.pureGemmEarlyTerms and self.pureGemmEarlyIssueAtStart(kernel):
+      module.add(self.pureGemmEarlyFlagIssueStart(kernel))
+
     needPackK16  = False
     needPackK8Lw = False
     needPackK8Hi = False
@@ -9930,6 +9936,16 @@ class KernelWriterAssembly(KernelWriter):
       if emitPlsinSkip:
         module.add(SCmpEQU32(src0=sgpr("PostLoopFusedStore"), src1=1, comment="PostLoopStoreInNll: fused owner already loaded store kernargs?"))
         module.add(SCBranchSCC1(labelName=skipStoreLoadLabel.getLabelName(), comment="PostLoopStoreInNll: skip redundant store-kernarg reload for fused owner"))
+      # Pure-gemm flag computed in the prologue: the pure store pass reads none of these
+      # kernargs, so skip the load (and with it the post-loop kmcnt wait).
+      pureEarlySkip = self.states.pureGemmEarlyTerms is not None
+      if pureEarlySkip:
+        assert self.states.pureGemmEarlyArgOffsets == (self.argLoader.getOffset(), self.externalArgLoader.getOffset()), \
+          "pure-gemm flag: kernarg offsets moved between the prologue and endSummation"
+        pureSkipLabel = Label(label=self.labels.getNameInc("PureGemmSkipStoreSgprLoad"), comment="")
+        pureJoinLabel = Label(label=self.labels.getNameInc("PureGemmSkipStoreSgprLoadEnd"), comment="")
+        module.add(SCmpEQU32(src0=sgpr("PureGemmFlag"), src1=1, comment="pure-gemm flag == 1 ?"))
+        module.add(SCBranchSCC1(labelName=pureSkipLabel.getLabelName(), comment="pure: skip store-kernarg load"))
       if kernel["ProblemType"]["SupportUserArgs"]:
         extReadEpilogueLabel    = Label(label=self.labels.getNameInc("LoadExternalEpilogueStruct"), comment="")
         extReadEpilogueLabelEnd = Label(label=self.labels.getNameInc("LoadExternalEpilogueStructEnd"), comment="")
@@ -10037,6 +10053,17 @@ class KernelWriterAssembly(KernelWriter):
         loadModule = module.addModuleAsFlatItems(self.argLoader.loadAllKernArg(startVgprName, "KernArgAddress", numStoreSgprToLoad))
         self.states.numStoreSgprInst = countSMemLoad(loadModule)
         self.argLoader.setOffset(argOffset) # Restore offset
+      if pureEarlySkip:
+        module.add(SBranch(labelName=pureJoinLabel.getLabelName(), comment="store kernargs loaded"))
+        module.add(pureSkipLabel)
+        if isPersistent(kernel):
+          # Persistent kernels run the bias/scaleAlphaVec prelude before the pure branch:
+          # give it the values the flag proved (null pointers, activation none) instead
+          # of stale registers. Non-persistent kernels branch before the prelude.
+          for name, size in zip(self.states.numStoreSgprNames, self.states.numStoreSgprNameSizes):
+            for i in range(size):
+              module.add(SMovB32(dst=sgpr(name, 1) if i == 0 else sgpr("%s+%u" % (name, i)), src=0, comment="pure: %s = 0" % name))
+        module.add(pureJoinLabel)
       if skipStoreLoadLabel is not None:
         module.add(skipStoreLoadLabel)
 
@@ -18757,8 +18784,10 @@ class KernelWriterAssembly(KernelWriter):
       terms.insert(0, "Beta")
     return terms
 
-  def pureGemmEpilogueFlag(self, kernel, terms, flagSgpr):
+  def pureGemmEpilogueFlag(self, kernel, terms, flagSgpr, regs=None):
     """Set sgpr *flagSgpr* to 1 when every term says "feature off", else 0.
+
+    *regs* maps a term to the sgpr index holding it (prologue loads); default: its named sgpr.
 
     Must be emitted while the pointers are still defined (the prelude undefines
     AddressScaleAlphaVec), so persistent kernels hold the flag until the trees.
@@ -18777,9 +18806,9 @@ class KernelWriterAssembly(KernelWriter):
               module.add(SOrB32(dst=sgpr(tmpSgprInfo.idx), src0=sgpr("Beta+%u" % i), src1=sgpr(tmpSgprInfo.idx), comment="tmp |= Beta[%u]" % i))
             module.add(self.getSCMPKInstruction("EQU32", tmpSgprInfo.idx, 0, comment="Beta == 0 ?"))
       elif term == "ActivationType":
-        module.add(self.getSCMPKInstruction("EQU32", "ActivationType", 0, comment="activationType == none ?"))
+        module.add(self.getSCMPKInstruction("EQU32", regs[term] if regs else "ActivationType", 0, comment="activationType == none ?"))
       else:
-        module.add(SCmpEQU64(src0=sgpr(term, 2), src1=0, comment="%s == 0 (null) ?" % term))
+        module.add(SCmpEQU64(src0=sgpr(regs[term] if regs else term, 2), src1=0, comment="%s == 0 (null) ?" % term))
       module.add(SCSelectB32(dst=sgpr(flagSgpr), src0=sgpr(flagSgpr), src1=0, comment="%s set -> not pure" % term))
     return module
 
@@ -18792,6 +18821,160 @@ class KernelWriterAssembly(KernelWriter):
     with self.allocTmpSgpr(3, tag="pureGemmBranchTmp") as tmpSgprInfo:
       module.add(SLongBranchPositive(pureLabel, tmpSgprInfo, comment="pure-gemm store pass"))
     module.add(notPure)
+    return module
+
+  def pureGemmEarlyFlagTerms(self, kernel):
+    """Terms of the pure-gemm flag when it is computed in the prologue, else None.
+
+    The prologue variant needs the shadow init (PrefetchGlobalRead + doShadowInit): the
+    kernargs are loaded right after the first global/TDM read issue and the flag is folded
+    into the whole-kernel sgpr PureGemmFlag before the main loop. The terms are the ones
+    the post-loop store (notLocalSplitUGlobalWrite / localSplitUGlobalWrite) uses.
+    """
+    if not (kernel["PrefetchGlobalRead"] and self.states.doShadowInit):
+      return None
+    if not self.states.numStoreSgprToLoad:
+      return None
+    noGSUBranch = (kernel["GlobalSplitU"] == 0 and (not self.states.tileProcessing.requiresWorkspaceReductionStorePath
+                                                    or isPersistentDataParallel(kernel)))
+    gsuLimit = 1 if noGSUBranch or self.debugConfig.splitGSU else 2
+    terms = self.pureGemmEpilogueTerms(kernel, gsuLimit, kernel["GlobalSplitU"])
+    if not terms:
+      return None
+    sizes = dict(zip(self.states.numStoreSgprNames, self.states.numStoreSgprNameSizes))
+    want = {"AddressBias": 2, "AddressScaleAlphaVec": 2, "ActivationType": 1}
+    if any(t != "Beta" and sizes.get(t) != want.get(t) for t in terms):
+      return None
+    # The ArgType==2 offset of ActivationType assumes the activation args precede it.
+    if "ActivationType" in terms and not kernel["ProblemType"]["ActivationType"].getAdditionalArgStringList():
+      return None
+    return terms
+
+  def pureGemmEarlyIssueAtStart(self, kernel):
+    """Non-persistent kernels issue the flag's kernarg loads in the prologue, right after
+    defineVariableSgprs, so the WGM/TDM setup hides their latency. kmcnt only waits for 0,
+    so a later prologue s_wait_kmcnt would also drain them: when ClusterAIDRemap waits for
+    MSG_RTN_GET_SE_AID_ID before the first TDM, the loads are issued after that wait instead
+    (issued before it they delay the first TDM, ATT: +107..+171 cycles, -2..-5% on such
+    kernels). Persistent kernels issue per tile in the shadow init: the flag is
+    tile-invariant, but the start of the kernel is outside the persistent loop."""
+    return not isPersistent(kernel)
+
+  def _pureGemmEarlyAfterClusterAIDRemap(self, kernel):
+    """ClusterAIDRemap emits the prologue's SE_AID_ID kmcnt wait (same gate as the remap)."""
+    cs, ck = kernel["ClusterDim"]
+    return clusterEnabled(kernel["ClusterDim"]) and kernel["ClusterAIDMapping"] != -1 \
+      and not kernel["SpaceFillingAlgo"] and not isPersistent(kernel) \
+      and not (cs & (cs - 1)) and not (ck & (ck - 1))
+
+  def _pureGemmEarlyArgOffsets(self, kernel):
+    """{term: (kernarg byte offset, ArgType==2 external-struct byte offset, dwords)} of the
+    flag's pointer/enum terms, mirroring endSummation's store-kernarg layout."""
+    sizes = dict(zip(self.states.numStoreSgprNames, self.states.numStoreSgprNameSizes))
+    normal, off = {}, self.argLoader.getOffset()
+    for name in self.states.numStoreSgprNames:
+      normal[name] = off
+      off += 4 * sizes[name]
+    info = self.states.userArgsInfo
+    ext = {}
+    savOff = self.externalArgLoader.getOffset() + info.scaleASize + info.scaleBSize + info.scaleCSize + info.scaleDSize
+    ext["AddressScaleAlphaVec"] = savOff
+    ext["AddressBias"] = savOff + info.scaleAlphaVecSize
+    actOff = ext["AddressBias"] + info.biasSize + info.factorDimSize + info.eSize
+    actNames = kernel["ProblemType"]["ActivationType"].getAdditionalArgStringList()
+    ext["ActivationType"] = actOff + 4 * len(actNames) * self.states.numActivationArgSize
+    return {t: (normal[t], ext[t], sizes[t]) for t in self.states.pureGemmEarlyTerms if t != "Beta"}
+
+  def pureGemmEarlyFlagIssue(self, kernel):
+    """Prologue half 1: issue the flag's kernarg loads (pointers, activation type) into a
+    few transient sgprs. Only these terms are loaded, not the whole store-kernarg block."""
+    module = Module("PureGemmEarlyFlagIssue")
+    if not self.states.pureGemmEarlyTerms:
+      return module
+    module.addComment1("Pure-gemm flag (prologue): load %s" % ", ".join(self.states.pureGemmEarlyTerms))
+    self._pureGemmEarlyAlloc(kernel, module)
+    module.add(self._pureGemmEarlyLoads(kernel))
+    return module
+
+  def pureGemmEarlyFlagIssueStart(self, kernel):
+    """Non-persistent, start of the prologue: allocate and issue the loads, or defer them to
+    the end of ClusterAIDRemap (see pureGemmEarlyIssueAtStart)."""
+    module = Module("PureGemmEarlyFlagIssueStart")
+    if not self.states.pureGemmEarlyTerms:
+      return module
+    module.addComment1("Pure-gemm flag (prologue): load %s" % ", ".join(self.states.pureGemmEarlyTerms))
+    self._pureGemmEarlyAlloc(kernel, module)
+    if self._pureGemmEarlyAfterClusterAIDRemap(kernel):
+      module.addComment1("issued after the SE_AID_ID wait of ClusterAIDRemap")
+      self.states.pureGemmEarlyDeferred = True
+    else:
+      module.add(self._pureGemmEarlyLoads(kernel))
+    return module
+
+  def pureGemmEarlyFlagIssueDeferred(self, kernel):
+    """End of ClusterAIDRemap (and the fold, as a fallback): issue the deferred loads."""
+    module = Module("PureGemmEarlyFlagIssueDeferred")
+    if self.states.pureGemmEarlyTerms and self.states.pureGemmEarlyDeferred:
+      self.states.pureGemmEarlyDeferred = False
+      module.addComment1("Pure-gemm flag: load %s" % ", ".join(self.states.pureGemmEarlyTerms))
+      module.add(self._pureGemmEarlyLoads(kernel))
+    return module
+
+  def _pureGemmEarlyAlloc(self, kernel, module):
+    """Define PureGemmFlag and check out the transient sgprs the loads write."""
+    if "PureGemmFlag" not in self.sgprs:
+      # Whole-kernel flag; defined here (not in _initKernel) so the sgpr layout up to the
+      # prologue is unchanged. defineSgpr keeps it off the free-variable sgprs, and
+      # nonPostLoopSgpr keeps it out of the post-loop reclaim.
+      module.add(self.defineSgpr("PureGemmFlag", 1))
+      self.states.nonPostLoopSgpr.append("PureGemmFlag")
+    self.states.pureGemmEarlyArgOffsets = (self.argLoader.getOffset(), self.externalArgLoader.getOffset())
+    layout = self._pureGemmEarlyArgOffsets(kernel)
+    regs = {}
+    # Like defineSgpr: stay off the free-variable sgprs, whose owners may reclaim them
+    # before the fold.
+    for v in self.states.freeSgprVarPool:
+      self.setSgprToInUseState(v)
+    for term, (_, _, dwords) in layout.items():
+      regs[term] = self.sgprPool.checkOutAligned(dwords, dwords, tag="pureGemmEarly_" + term, preventOverflow=False)
+    for v in self.states.freeSgprVarPool:
+      self.setSgprToFreeState(v)
+    self.states.pureGemmEarlyNames = regs
+    self.states.pureGemmEarlyLayout = layout
+
+  def _pureGemmEarlyLoads(self, kernel):
+    """The flag's kernarg loads into the transient sgprs (both ArgType layouts)."""
+    module = Module("PureGemmEarlyFlagLoads")
+    regs, layout = self.states.pureGemmEarlyNames, self.states.pureGemmEarlyLayout
+    def loads(ext):
+      for term, (off, extOff, dwords) in layout.items():
+        module.add(self.argLoader.loadKernArg(regs[term], "KernArgAddress", sgprOffset=hex(extOff if ext else off), dword=dwords))
+    if kernel["ProblemType"]["SupportUserArgs"]:
+      extLabel = Label(self.labels.getNameInc("PureGemmFlagExternalArgs"), "")
+      endLabel = Label(self.labels.getNameInc("PureGemmFlagArgsEnd"), "")
+      self.cmpNamedArgTypeEq(module, 2, "ArgType == 2 ?")
+      module.add(SCBranchSCC1(labelName=extLabel.getLabelName(), comment="branch if ArgType == 2"))
+      loads(False)
+      module.add(SBranch(labelName=endLabel.getLabelName()))
+      module.add(extLabel)
+      loads(True)
+      module.add(endLabel)
+    else:
+      loads(False)
+    return module
+
+  def pureGemmEarlyFlagCompute(self, kernel):
+    """Prologue half 2: wait for the loads, fold them into PureGemmFlag, free the transients."""
+    module = Module("PureGemmEarlyFlagCompute")
+    if not self.states.pureGemmEarlyTerms:
+      return module
+    regs = self.states.pureGemmEarlyNames
+    module.add(self.pureGemmEarlyFlagIssueDeferred(kernel))
+    module.add(SWaitCnt(kmcnt=0, comment="pure-gemm flag kernargs"))
+    module.add(self.pureGemmEpilogueFlag(kernel, self.states.pureGemmEarlyTerms, self.sgprs["PureGemmFlag"], regs=regs))
+    for idx in regs.values():
+      self.sgprPool.checkIn(idx)
+    self.states.pureGemmEarlyNames = None
     return module
 
   def globalWriteElements(self, kernel, tPA, tPB, vectorWidths_2, vectorWidths_1, elements_2, elements_1,
@@ -18813,8 +18996,16 @@ class KernelWriterAssembly(KernelWriter):
     module.addComment2("Global Write Elements")
     if kernel["ProblemType"]["OutputAmaxD"]:
         module.add(VMovB32(dst=vgpr("AmaxOut"), src="0"))
-    if self.states.numStoreSgprToLoad or self.states.numStoreSgprToLoad2: # Wait for kernel args
-      module.add(SWaitCnt(kmcnt=0, comment="wait for %u bytes of kern args."%((self.states.numStoreSgprToLoad+self.states.numStoreSgprToLoad2) * 4)))
+    # Pure-gemm flag computed in the prologue (PureGemmFlag): a non-persistent kernel
+    # branches to the pure pass before the bias/scale prelude, and endSummation skipped the
+    # store-kernarg load for it, so the kmcnt wait moves behind that branch (and to the
+    # GSU0 pass), off the pure path.
+    pureEarly = bool(self.states.pureGemmEarlyTerms) and bool(self.pureGemmEpilogueTerms(
+      kernel, 1 if noGSUBranch or self.debugConfig.splitGSU else 2, kernel["GlobalSplitU"]))
+    deferTopKmWait = pureEarly and not isPersistent(kernel) and not self.states.numStoreSgprToLoad2
+    kmWaitComment = "wait for %u bytes of kern args."%((self.states.numStoreSgprToLoad+self.states.numStoreSgprToLoad2) * 4)
+    if (self.states.numStoreSgprToLoad or self.states.numStoreSgprToLoad2) and not deferTopKmWait: # Wait for kernel args
+      module.add(SWaitCnt(kmcnt=0, comment=kmWaitComment))
 
     if not noGSUBranch:
       labelMB = Label(self.labels.getNameInc("GW_MB"), comment="Global Write MB")
@@ -18969,6 +19160,8 @@ class KernelWriterAssembly(KernelWriter):
           elements     = elements_1
       pureRestore = None
       pureFlagHeld = False
+      if deferTopKmWait and gsuLimit > 1 and gsuLimitIdx == 0 and not isPurePass:
+        module.add(SWaitCnt(kmcnt=0, comment=kmWaitComment))
       if isPurePass:
         module.add(pureLabel)
         module.addComment1("Pure-gemm store pass: beta, bias, scaleAlphaVec and activation compiled out")
@@ -19003,7 +19196,15 @@ class KernelWriterAssembly(KernelWriter):
           module.add(self.setSgprToInUseState("AddressScaleAlphaVec"))
           module.add(self.setSgprToInUseState("SrdScaleAlphaVec"))
 
-      if pureTerms and not isPurePass and gsuLimitIdx == gsuLimit - 1:
+      if pureTerms and not isPurePass and gsuLimitIdx == gsuLimit - 1 and pureEarly:
+        assert pureTerms == self.states.pureGemmEarlyTerms
+        # Flag already in PureGemmFlag (prologue); it is never checked in, so it needs no hold.
+        pureFlagSgpr = "PureGemmFlag"
+        if not pureAtTrees:
+          module.add(self.pureGemmEpilogueBranch(pureFlagSgpr, pureLabel))
+          if deferTopKmWait and (self.states.numStoreSgprToLoad or self.states.numStoreSgprToLoad2):
+            module.add(SWaitCnt(kmcnt=0, comment=kmWaitComment))
+      elif pureTerms and not isPurePass and gsuLimitIdx == gsuLimit - 1:
         if pureAtTrees:
           pureFlagSgpr = self.sgprPool.checkOut(1, tag="globalWriteElements_pureFlag", preventOverflow=False)
           module.add(self.pureGemmEpilogueFlag(kernel, pureTerms, pureFlagSgpr))
@@ -19710,7 +19911,9 @@ class KernelWriterAssembly(KernelWriter):
 
       if pureAtTrees and not isPurePass and gsuLimitIdx == gsuLimit - 1:
         module.add(self.pureGemmEpilogueBranch(pureFlagSgpr, pureLabel))
-        if arrivalFixup:
+        if pureEarly:
+          pass # whole-kernel PureGemmFlag: never checked in, nothing to hold
+        elif arrivalFixup:
           # The last arriving part runs writePartials, then falls back through SK_Store into
           # this branch, so writePartials (generated below) must not reuse the flag sgpr.
           pureFlagHeld = True

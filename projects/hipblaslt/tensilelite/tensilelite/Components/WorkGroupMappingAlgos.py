@@ -613,6 +613,8 @@ def ClusterAIDRemap(writer, kernel, sgprWGM):
         module.add(SLShiftLeftB32(dst=sgpr(sT), shiftHex=hex(log2ck), src=sgpr(sT), comment="new cy * Ck"))
         module.add(SAddU32(dst=sgpr("WorkGroup1"), src0=sgpr("WorkGroup1"), src1=sgpr(sT), comment="WorkGroup1 = new cy * Ck + peer y"))
         module.add(labelEnd)
+    # Pure-gemm flag kernargs held back so the SE_AID_ID wait above does not drain them.
+    module.add(writer.pureGemmEarlyFlagIssueDeferred(kernel))
     return module
 
 def chiplet_transform_chunked(writer, kernel, sgprNumXCC, sgprIndex, sgprNumWG, sgprChunkSize):
