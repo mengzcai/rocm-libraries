@@ -566,6 +566,30 @@ BenchmarkProblems:
               DepthU: 256
               LdsBlockSizePerPadA: 512
               LdsBlockSizePerPadB: 512
+            # TailFolding (the K tail folded into the unroll loop): NoLoadLoop with PrefetchGL2 0 / 1,
+            # HalfPLR (SuppressNoLoadLoop) with PrefetchGL2 2
+            - MatrixInstruction: [16, 16, 32, 1, 1, 1, 1, 2, 1]
+              WorkGroup: [32, 1, 1]
+              DepthU: 128
+              LdsBlockSizePerPadA: 256
+              LdsBlockSizePerPadB: 256
+              TailFolding: 1
+            - MatrixInstruction: [16, 16, 32, 1, 1, 1, 1, 2, 1]
+              WorkGroup: [32, 1, 1]
+              DepthU: 128
+              LdsBlockSizePerPadA: 256
+              LdsBlockSizePerPadB: 256
+              PrefetchGL2: 1
+              TailFolding: 1
+            - MatrixInstruction: [16, 16, 32, 1, 1, 2, 2, 2, 2]
+              WorkGroup: [32, 4, 1]
+              DepthU: 128
+              LdsBlockSizePerPadA: 256
+              LdsBlockSizePerPadB: 256
+              HalfPLR: 2
+              PrefetchLocalRead: 1
+              PrefetchGL2: 2
+              TailFolding: 1
         - PrefetchLocalRead: [2, 3]
         - PrefetchGlobalRead: [2]
         - ScheduleIterAlg: [4]
@@ -599,5 +623,7 @@ BenchmarkProblems:
           - Exact: [720, 432, 1, 256] # DU128: 2 iterations
           - Exact: [576, 208, 1, 736] # DU256: 2 iterations + tail
           - Exact: [576, 208, 1, 512] # DU256: 2 iterations
+          - Exact: [720, 432, 1, 96]  # K < DepthU
+          - Exact: [130, 70, 1, 65601] # TailFolding: K dim above 16 bits
         - ActivationArgs:
           - [Enum: none]

@@ -350,6 +350,9 @@ def _getName(state, requiredParameters: frozenset, splitGSU: bool, ignoreInterna
     # PrefetchGL2SAddr=False (vgpr-pair address) is the default; naming it would rename every kernel.
     if not state.get("PrefetchGL2SAddr", False):
       requiredParametersTemp.discard("PrefetchGL2SAddr")
+    # TailFolding=0 is the default; naming it would rename every kernel.
+    if not state.get("TailFolding", 0):
+      requiredParametersTemp.discard("TailFolding")
 
     for key in sorted(requiredParametersTemp):
       if key not in state or key == "CustomKernel":

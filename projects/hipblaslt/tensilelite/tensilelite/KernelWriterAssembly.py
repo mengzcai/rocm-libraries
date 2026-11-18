@@ -560,6 +560,8 @@ class KernelWriterAssembly(KernelWriter):
     fields = [tdmKDimField(kernel, tc) for tc in (tcA, tcB)]
     assert None not in fields and fields[0][0] == fields[1][0], \
       "%s/%s do not keep K in one field: %s" % (tcA, tcB, fields)
+    if not kernel["ReuseAcrossPersistent"]:
+      return self._tailFoldingShrinkTdmKDim32(kernel, tPA, tPB, fields, module)
     assert self.rapResidentKTiles(kernel) * kernel["DepthU"] < (1 << 16), \
       "the TDM K dim's high half is not zero"
     dword = fields[0][0]
@@ -583,6 +585,33 @@ class KernelWriterAssembly(KernelWriter):
                                comment="RAP: a borrow means this wave's K ran out"))
         module.add(SAndB32(dst=sgpr(group1), src0=sgpr(group1), src1=sgpr(tmpSgprRes.idx),
                            comment="RAP: clamp the K dim at zero"))
+    return module
+
+  def _tailFoldingShrinkTdmKDim32(self, kernel, tPA, tPB, fields, module) -> Module:
+    """TailFolding: K dim -= the k-tile the address just advanced, as a 32-bit field (low half in
+    the dword's high half, high half in the next dword's low half). It only goes below zero after
+    the last k-tile has been issued, when no TDM load reads the descriptor any more."""
+    tcA, tcB = tPA["tensorChar"], tPB["tensorChar"]
+    if self.states.staggerUCode:
+      # Solution rejects these; StaggerU wraps the address back to K = 0 mid-loop.
+      self.states.overflowedResources = 13
+      return module
+    dword = fields[0][0]
+    group1 = "tdm%sGroup1" % self._tdmPairedParityOrder(kernel, tPA, tPB)[0]["tensorChar"]
+    lo, hi = sgpr("%s+%u" % (group1, dword)), sgpr("%s+%u" % (group1, dword + 1))
+    if fields[0][1] == fields[1][1]:
+      step = fields[0][1]
+      module.add(SSubU32(dst=lo, src0=lo, src1=hex((step << 16) & 0xffffffff), comment="TailFolding: K dim -= %u (low half)" % step))
+      module.add(SSubBU32(dst=hi, src0=hi, src1=step >> 16, comment="TailFolding: K dim (high half)"))
+    else:
+      assert tdmKDimStepIsAddrInc(kernel, tcA) and tdmKDimStepIsAddrInc(kernel, tcB), \
+        "%s/%s step K differently and not by bytes" % (tcA, tcB)
+      with self.allocTmpSgpr(2, tag="tailFoldingShrinkTdmKDim32") as t:
+        inc = sgpr("tdm%s%sIncs" % (tcA, tcB))
+        module.add(SLShiftLeftB32(dst=sgpr(t.idx), shiftHex=hex(16), src=inc, comment="TailFolding: this wave's K step (low half)"))
+        module.add(SLShiftRightB32(dst=sgpr(t.idx + 1), shiftHex=hex(16), src=inc, comment="TailFolding: this wave's K step (high half)"))
+        module.add(SSubU32(dst=lo, src0=lo, src1=sgpr(t.idx), comment="TailFolding: K dim -= step (low half)"))
+        module.add(SSubBU32(dst=hi, src0=hi, src1=sgpr(t.idx + 1), comment="TailFolding: K dim (high half)"))
     return module
 
   def rapNullTdmDescriptorForEvenWaves(self, kernel, groupSgprName) -> Module:
@@ -1441,6 +1470,8 @@ class KernelWriterAssembly(KernelWriter):
         gl2Tensors.append("Metadata")
       for tc in gl2Tensors:
         module.add(self.defineSgpr(f"GL2PrefetchInc{tc}", numGL2IncSgpr, numGL2IncSgpr))
+      if self.tailFoldingGL2Clamp(kernel):
+        module.add(self.defineSgpr("GL2FoldThreshold", 1))
       if GL2PrefetchLoad.useSAddr(kernel):
         for tc in gl2Tensors:
           module.add(self.defineSgpr(f"GL2PrefetchBase{tc}", 2, 2))
@@ -2805,6 +2836,8 @@ class KernelWriterAssembly(KernelWriter):
         msg = "decoupled PGR thick-wait not covered in the emitted assembly"
       elif self.states.overflowedResources == 12:
         msg = "tail LDS reset has one block stride and a divergent pair has two"
+      elif self.states.overflowedResources == 13:
+        msg = "TailFolding with StaggerU code (StaggerU wraps the address back to K = 0)"
       else:
         msg = "unknown"
 
@@ -9144,6 +9177,12 @@ class KernelWriterAssembly(KernelWriter):
       divisor = kernel["DepthU"]
 
       module.add(scalarStaticDivideAndRemainder(qReg=quotient, rReg=-1, dReg=dividend, divisor=divisor, tmpSgprRes=tmpSgprInfo, doRemainder=False))
+      if kernel.get("_TailFolding", False) and not kernel["ReuseAcrossPersistent"]:
+          # TailFolding: the partial last k-tile is one more unroll iteration.
+          tmpSgpr = tmpSgprInfo.idx
+          module.add(SAndB32(dst=sgpr(tmpSgpr), src0=sgpr(dividend), src1=divisor - 1, comment="K %% %u" % divisor))
+          module.add(SCSelectB32(dst=sgpr(tmpSgpr), src0=1, src1=0, comment="partial last k-tile?"))
+          module.add(SAddU32(dst=sgpr(quotient), src0=sgpr(quotient), src1=sgpr(tmpSgpr), comment="TailFolding: ceil(K / DepthU)"))
       if self.states.tailloopInNll:
           maxUnit = self.states.tailloopInNllmaxUnit
           sgprSizesSum = sgpr("SizesSum+%u" % self.states.unrollIdx)

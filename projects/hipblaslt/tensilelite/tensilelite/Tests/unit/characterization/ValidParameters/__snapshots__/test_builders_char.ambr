@@ -1515,6 +1515,7 @@
     'TDMLoadWaveSync',
     'TDMPlusLdsBuf',
     'TDMSplit',
+    'TailFolding',
     'TailloopInNll',
     'TemporalHint',
     'TemporalHintA',
@@ -2861,6 +2862,14 @@
       'head': list([
         False,
         True,
+      ]),
+      'len': 2,
+      'type': 'list',
+    }),
+    'TailFolding': dict({
+      'head': list([
+        0,
+        1,
       ]),
       'len': 2,
       'type': 'list',

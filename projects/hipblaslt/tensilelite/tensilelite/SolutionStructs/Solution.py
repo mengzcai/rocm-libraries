@@ -58,7 +58,8 @@ from ..Components.DecouplePGR import pgrLevelsForTensors, ldsBlocksForPgrLevel, 
 from ..Components.TDMFuse import TDM_FUSE_GROUPING, TDM_SCALE_TENSORS, tdmBothTensors, \
                                        tdmGroupingName, tdmKDimTrackable, tdmLiveScales, \
                                        tdmPairOnEveryWave, \
-                                       tdmPapRejectReason, tdmWavePartition, tdmWaveSeparated
+                                       tdmPapRejectReason, tdmSeparateABDescriptors, tdmWavePartition, \
+                                       tdmWaveSeparated
 from ..Common.TypeValidationErrors import ConfigTypeError
 from ..CustomKernels import isCustomKernelConfig, supportsUserSgprKernargPreload, validateCustomPersistentArgs
 from ..SolutionStructs.LdsPadding import get_fp4_mt_config, get_fp8_mt_config, get_mxs_mt_config, \
@@ -4421,6 +4422,37 @@ class Solution(collections.abc.Mapping):
     if (state["enableLDSTrA"] or state["enableLDSTrB"]) and (not state["1LDSBuffer"] and state["ExpandPointerSwap"]):
       reject(state, printRejectionReason, "Current LDSTrInst implementation does not support 1LDSBuffer=0")
       return
+
+    # TailFolding: nothing to fold without a K tail; ReuseAcrossPersistent folds on its own.
+    if state.get("TailFolding", 0) and state["NoTailLoop"]:
+      state["TailFolding"] = 0
+    if state.get("TailFolding", 0):
+      du = state["DepthU"]
+      # Mirrors KernelWriter's staggerUCode: every buffer-load kernel outside a cluster emits it.
+      staggerCode = not (state["TailloopInNll"] or not state["BufferLoad"] or state.get("UseSubtileImpl", False)
+                         or clusterEnabled(state["ClusterDim"]))
+      unsupported = [
+        (not (state["enableTDMA"] and state["enableTDMB"]), "TDM for A and B"),
+        (state["PrefetchGlobalRead"] != 2, "PrefetchGlobalRead 2"),
+        (isPersistent(state), "a non-persistent kernel (DataParallel/StreamK tiles start mid-K)"),
+        (state["GlobalSplitU"] != 1, "GlobalSplitU 1 (each split would need its own K-dim start and a GSU-wide step)"),
+        (du & (du - 1) != 0, "a power-of-2 DepthU"),
+        (not tdmWaveSeparated(state) or tdmSeparateABDescriptors(state) or tdmPairOnEveryWave(state, "A", "B"),
+         "one wave-separated TDM descriptor set for A and B (no separate or every-wave sets)"),
+        (not tdmKDimTrackable(state), "K in one TDM descriptor field (no TDMIterateMode)"),
+        (staggerCode, "no StaggerU code (StaggerU wraps the address back to K = 0 mid-loop, which a "
+                      "shrinking K dim cannot follow; StaggerU code is emitted for every non-cluster kernel)"),
+        (state["ProblemType"]["MXBlockA"] or state["ProblemType"]["MXBlockB"] or state["ProblemType"]["Sparse"],
+         "no MX scales or sparse metadata"),
+        (state.get("TDMSplit", 0) or state["DirectToVgprA"] or state["DirectToVgprB"]
+         or state.get("UseSubtileImpl", False), "TDMSplit 0, no DirectToVgpr, UseSubtileImpl 0"),
+      ]
+      for bad, need in unsupported:
+        if bad:
+          reject(state, printRejectionReason, "TailFolding requires %s" % need)
+          return
+      state["_TailFolding"] = True
+      state["NoTailLoop"] = True
 
   @staticmethod
   def rapMaxResidentKTiles(state, problemType, isa, isaInfoMap, packedC0, packedC1):

@@ -80,6 +80,7 @@ from .Common.ValidParameters import resolveSwInstructionPrefetch, \
 from .SolutionStructs.Naming import getKernelFileBase, getKernelNameMin
 from .Toolchain.Component import Assembler
 
+import contextlib
 import rocisa
 import math
 import abc
@@ -4733,8 +4734,14 @@ class KernelWriter(PersistentKernelState, StreamKKernelState, metaclass=abc.ABCM
     if kernel["PrefetchGL2"]:
       loopCounter = self.loopCounter(kernel, self.states.unrollIdx)
       self.codes.gl2PrefetchIncrement = Module()
-      self.codes.gl2PrefetchIncrement.add(SCmpLeU32(loopCounter, kernel["PrefetchGlobalRead"] + kernel["PrefetchGL2"], \
-        comment="counterL<=PGR+GL2"))
+      # TailFolding: the last k-tile is partial; stop one k-tile earlier so no prefetch passes K.
+      if self.tailFoldingGL2Clamp(kernel):
+        # TailFolding: PGR+GL2, +1 when K has a tail (selected once before the loop)
+        self.codes.gl2PrefetchIncrement.add(SCmpLeU32(loopCounter, sgpr("GL2FoldThreshold"), \
+          comment="counterL<=PGR+GL2(+1 if K tail)"))
+      else:
+        self.codes.gl2PrefetchIncrement.add(SCmpLeU32(loopCounter, kernel["PrefetchGlobalRead"] + kernel["PrefetchGL2"], \
+          comment="counterL<=PGR+GL2"))
       self.codes.gl2PrefetchIncrement.add(self.gl2PrefetchClearIncrement(kernel, tensorParametersA, tensorParametersB))
       self.codes.gl2PrefetchIncrement.add(self.gl2PrefetchIncrementAddr(kernel, tensorParametersA, tensorParametersB))
       self.codes.gl2Prefetch = Module()
@@ -6339,17 +6346,34 @@ class KernelWriter(PersistentKernelState, StreamKKernelState, metaclass=abc.ABCM
     if kernel["PrefetchGL2"]:
       skipGL2Label = Label(self.rapLabel("Skip_GL2"), "")
       loopCounter = self.loopCounter(kernel, self.states.unrollIdx)
-      module.add(SCmpLeU32(src0=loopCounter, src1=hex(kernel["PrefetchGlobalRead"]), \
-        comment="counterL<=PGR"))
-      module.add(SCBranchSCC1(labelName=skipGL2Label.getLabelName(), comment=""))
-      module.add(self.gl2PrefetchSkipPGR(kernel, tensorParametersA, tensorParametersB))
-      module.add(self.gl2PrefetchIssueLoad(kernel, tensorParametersA, tensorParametersB))
-      if kernel["PrefetchGL2"] == 2:
-        module.add(SCmpLeU32(src0=loopCounter, src1=hex(kernel["PrefetchGlobalRead"]+1), comment="counterL<=PGR+1"))
+      pgr = kernel["PrefetchGlobalRead"]
+      gl2 = kernel["PrefetchGL2"]
+      gl2Fold = self.tailFoldingGL2Clamp(kernel)
+      # TF0: no tmp sgpr, so its allocation and code stay unchanged
+      with (self.allocTmpSgpr(1, tag="gl2FoldPreLoop") if gl2Fold else contextlib.nullcontext()) as tmp:
+        if gl2Fold:
+          # TailFolding: when K has a tail the last k-tile is partial, so every GL2 prefetch threshold
+          # is one higher. Select the loop's PGR+GL2(+1) once here; the pre-loop ones are GL2 lower.
+          module.add(SAndB32(dst=sgpr("GL2FoldThreshold"), src0=sgpr("SizesSum+%u" % self.states.unrollIdx), \
+            src1=kernel["DepthU"] - 1, comment="K %% %u" % kernel["DepthU"]))
+          module.add(SCSelectB32(dst=sgpr("GL2FoldThreshold"), src0=pgr + gl2 + 1, src1=pgr + gl2, comment="PGR+GL2(+1 if K tail)"))
+          module.add(SSubU32(dst=sgpr(tmp.idx), src0=sgpr("GL2FoldThreshold"), src1=gl2, comment="PGR(+1 if K tail)"))
+          module.add(SCmpLeU32(src0=loopCounter, src1=sgpr(tmp.idx), comment="counterL<=PGR(+1 if K tail)"))
+        else:
+          module.add(SCmpLeU32(src0=loopCounter, src1=hex(pgr), comment="counterL<=PGR"))
         module.add(SCBranchSCC1(labelName=skipGL2Label.getLabelName(), comment=""))
-        module.add(self.gl2PrefetchIncrementAddr(kernel, tensorParametersA, tensorParametersB))
+        module.add(self.gl2PrefetchSkipPGR(kernel, tensorParametersA, tensorParametersB))
         module.add(self.gl2PrefetchIssueLoad(kernel, tensorParametersA, tensorParametersB))
-      module.add(skipGL2Label)
+        if gl2 == 2:
+          if gl2Fold:
+            module.add(SSubU32(dst=sgpr(tmp.idx), src0=sgpr("GL2FoldThreshold"), src1=1, comment="PGR+1(+1 if K tail)"))
+            module.add(SCmpLeU32(src0=loopCounter, src1=sgpr(tmp.idx), comment="counterL<=PGR+1(+1 if K tail)"))
+          else:
+            module.add(SCmpLeU32(src0=loopCounter, src1=hex(pgr+1), comment="counterL<=PGR+1"))
+          module.add(SCBranchSCC1(labelName=skipGL2Label.getLabelName(), comment=""))
+          module.add(self.gl2PrefetchIncrementAddr(kernel, tensorParametersA, tensorParametersB))
+          module.add(self.gl2PrefetchIssueLoad(kernel, tensorParametersA, tensorParametersB))
+        module.add(skipGL2Label)
 
     loopCopies = 3 if kernel["HalfPLR"] else 2 if expand else 1
     isDTV = (kernel["DirectToVgprA"] or kernel["DirectToVgprB"])
@@ -12068,6 +12092,11 @@ class KernelWriter(PersistentKernelState, StreamKKernelState, metaclass=abc.ABCM
     if self.do["Sync"]:
       return syncThreads(kernel, self.states.archCaps, self.states.asmCaps, comment, skipForceWaitcnt0=skipForceWaitcnt0, memoryToken=memoryToken)
     return Module("SyncThreads (Empty)")
+
+  def tailFoldingGL2Clamp(self, kernel):
+    """TailFolding (not RAP): the last k-tile is partial, so the GL2 prefetch stops one k-tile
+    earlier; a prefetch of it would reach up to DepthU - 1 elements past K."""
+    return kernel.get("_TailFolding", False) and not kernel["ReuseAcrossPersistent"]
 
   def _tailLoopBarrierTokens(self, kernel):
     # Explicit tail barriers must list every token; the auto-barrier pass doesn't cover them.

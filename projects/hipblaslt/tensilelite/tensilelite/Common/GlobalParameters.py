@@ -727,7 +727,9 @@ defaultBenchmarkCommonParameters = [
     # WorkGroupMapping orders clusters inside each half in bands of |WGM| clusters.
     {"ClusterAIDMapping": [-1]},
     {"HalfPLR": [0]},
-    {"TDMIterateMode": [0]}
+    {"TDMIterateMode": [0]},
+    # TailFolding (TDM only, see ValidParameters): 1 = fold the K tail into the unroll loop.
+    {"TailFolding": [0]}
 ]
 
 # dictionary of defaults comprised of default option for each parameter

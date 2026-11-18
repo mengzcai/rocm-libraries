@@ -1402,7 +1402,16 @@ validParameters = { # we need to make sure this matches develop
     # 1: Use iterate-mode for A
     # 2: Use iterate-mode for B
     # 3: Use iterate-mode for both A and B
-    "TDMIterateMode": [-1, 0, 1, 2, 3]
+    "TDMIterateMode": [-1, 0, 1, 2, 3],
+    # Fold the K tail (K % DepthU != 0) into the unroll loop instead of a tail loop.
+    # 0: tail loop
+    # 1: ceil(K / DepthU) unroll iterations; every TDM address step also shrinks the descriptor's
+    #    K dim, so TDM zero-fills the last k-tile beyond K (DepthU - K % DepthU extra zero MACs).
+    #    TDM A and B, PrefetchGlobalRead 2, GlobalSplitU 1, power-of-2 DepthU, K in one descriptor
+    #    field (no TDMIterateMode), no StaggerU code (StaggerU wraps the address back to K = 0),
+    #    no persistent kernel. ReuseAcrossPersistent folds on its own. Normalized to 0 when
+    #    AssertSummationElementMultiple % DepthU == 0.
+    "TailFolding": [0, 1]
 }
 
 

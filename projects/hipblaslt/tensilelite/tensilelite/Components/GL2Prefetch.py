@@ -6,7 +6,7 @@ from rocisa.instruction import SMulI32, SAddU64, VMovB32, VAddU32, VAddCOU32, \
     VAddCCOU32, VAddNCU64, VLShiftRightB32, VMulLOU32, VMulHIU32, GlobalPrefetchB8, \
     VCmpGtU32, VCndMaskB32, SSubI32, SMovB32, SMovB64, SAddU32, SAddCU32, SAndB32, SBranch, \
     SCBranchSCC0, SCBranchSCC1, SCMovB32, SCMovB64, SCmpEQU32, SLShiftRightB32, SLoadB64, \
-    SMulHIU32, SWaitCnt
+    SMulHIU32, SWaitCnt, SSubU32
 from rocisa.container import sgpr, vgpr, RegisterContainer, VCC, GLOBALModifiers, ContinuousRegister
 from rocisa.functions import vectorMultiply64Bpe, vectorMultiplyBpe, scalarMultiplyBpe, \
     scalarMultiply64Bpe, vectorStaticDivideAndRemainder, scalarStaticRemainder
@@ -358,6 +358,12 @@ class GL2PrefetchLoad(GL2Prefetch):
                         mod.add(SMulI32(perpStride, perpStride, mxUnit, "MX perp stride * mxUnit"))
                 else:
                     mod.add(SMulI32(perpStride, sgpr(sgprSizeFreeName), mxUnit, f"MX perp stride"))
+            # TailFolding runs the unroll loop once even for K < DepthU, and that iteration prefetches
+            # k-tile 0: keep its K index inside K (a no-op once K >= DepthU).
+            foldKClamp: bool = writer.tailFoldingGL2Clamp(kernel)
+            if foldKClamp:
+                assert not isMX, "TailFolding has no MX scales"
+                mod.add(SSubU32(sgpr(tmpSgprIdx2), sgpr("SizesSum+0"), 1, comment="TailFolding: last K index"))
             for i in range(nl):
                 vgprAddrName = f"{vgprAddrBaseName}_{i}"
                 vgprAddrNameHi = vgprAddrName + "+1"
@@ -377,6 +383,10 @@ class GL2PrefetchLoad(GL2Prefetch):
                 else:
                     mod.add(VCmpGtU32(VCC(), vgpr(vgprAddrName), sgpr(tmpSgprIdx1), comment="> edge limit?"))
                     mod.add(VCndMaskB32(vgpr(vgprAddrName), vgpr(vgprAddrName), sgpr(tmpSgprIdx1), VCC()))
+                if foldKClamp:
+                    kIdx = vgprAddrName if tlu else tmpVgprCoalIdx
+                    mod.add(VCmpGtU32(VCC(), vgpr(kIdx), sgpr(tmpSgprIdx2), comment="TailFolding: past K?"))
+                    mod.add(VCndMaskB32(vgpr(kIdx), vgpr(kIdx), sgpr(tmpSgprIdx2), VCC()))
                 if useSAddr:
                     # the per-lane byte offset must fit in 32 bits
                     mod.add(VMulLOU32(vgpr(vgprAddrName), vgpr(vgprAddrName), perpStride, comment="perp *= stride"))
